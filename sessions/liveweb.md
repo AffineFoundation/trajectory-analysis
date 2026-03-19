@@ -1,6 +1,6 @@
 LiveWeb 轨迹分析引擎迭代
 
-启动方式：/loop 10m LiveWeb 轨迹分析引擎迭代，读 sessions/liveweb.md 比较脚本内容与目标差距 执行当前任务，提升脚本质量
+启动方式：/loop 15m LiveWeb 轨迹分析引擎迭代，读 sessions/liveweb.md 比较脚本内容与目标差距 执行当前任务，提升脚本质量
 
 理解意图、设计方案、写代码、跑测试
 
@@ -11,12 +11,14 @@ LiveWeb 轨迹分析引擎迭代
 3. 数据获取的方式请看 scripts/FETCH_TRAJECTORIES.md 务必遵守
 
 纬度分析
+0. https://github.com/AffineFoundation/liveweb-arena.git（所有代码都会随时更新）根据最ß新的代码确定需要分析的网站，这个十分重要，比如你曾经错误标记 xen.com, fetch.ai 等都不是我们需要分析的网站
 1. 统计不同网站获得分数值
 2. 因为轨迹包含多个网站的子任务，要把自己每个子任务剥离出来独立分析 得分 和 没得分问题
 3. 是否有overfitting 或者 memorization 的pattern 自行 搜索决定 如何判断这点
 4. 需要给一个总体的描述
 5. 最开始给我 top findings 要求根据我分析报告背后的意图给出最优价值的 top findings
 7. 环境相关代码的提升点 理解环境背后设计意图 要求多角度充分论证，不得给出不扎实的意见
+8. 给出由于网络，评测环境 等导致任务无法有效提取信息的 可疑task id, 要求多次多角度审视，特别强调不是agent自身原导致的
 
 每次迭代工作流
 0. https://github.com/AffineFoundation/liveweb-arena.git（所有代码都会随时更新）确保所有分析都基于最新代码
@@ -88,6 +90,132 @@ LiveWeb 轨迹分析引擎迭代
 
 **对抗性不足 (迭代 20 待办)**:
 - 0-step 桶仅显示 1 task — 其他零导航任务 (view_more only, steps>0) 散布在 1-5/6-10 桶中。Tipping point 分析无法区分"用了 view_more 但没 goto"和"正常导航"。考虑增加 "goto=0" 行作为独立视角。
+
+### 迭代 20 (2026-03-19) — fetch.ai 误报修复 + 动态证据 + 拐点改进 + 空任务检测
+
+**变更**:
+- [x] 修复 fetch.ai 误报: 新增 FALSE_POSITIVE_DOMAINS 过滤表 (fetch.ai, xen.com, render.com, near.org 等)
+  - 之前 4 个 fetch.ai subtask 被错误标记为独立网站 + 3 个 forensics 误报
+  - 修复后 subtask 正确归属到 coingecko.com (实际查询站点)
+- [x] OPT-3a/3b 证据数字从硬编码改为动态计算
+  - OPT-3a stooq: 现在显示实际 goto/task 和 view_more 数据
+  - OPT-3b taostats: 动态计算 winning vs losing view_more 对比
+- [x] Tipping point 检测改进: 从"100% 零分桶"改为"相邻桶最大 scored-rate 下降"
+  - UID 153: 检测到 11-15→16-20 步 scored 率从 57%→38% (Δ=19%)
+- [x] 消除 root cause 重复计算 (generate_report 中 rc_* 只算一次)
+- [x] 修复 cw_answers/cw_sub 变量作用域问题 (在 if all_wrong 外初始化)
+- [x] 新增 EMPTY_TASK forensic flag: 检测 num_subtasks=0 的空任务
+
+**追加变更 (liveweb-arena 代码同步)**:
+- [x] KNOWN_SITES 缩减为实际活跃插件站点 (5 个: stooq, taostats, coingecko, hackernews, openlibrary)
+  - 移除 finance.yahoo.com, tradingview.com 等 17 个非插件站点到 KNOWN_EXTERNAL_SITES
+- [x] Action tracking 扩展: 新增 type(308), stop(269), click_role(196), wait(77), type_role(39) 的追踪
+  - 之前只追踪 goto/click/scroll/view_more, 遗漏了 35% 的 action
+- [x] 确认 max_steps=30 硬编码上限 (env.py line 137) — 解释了 4-site 83% 步数耗尽
+
+**关键数据（UID 153, top miner, 294 tasks）**:
+- Avg 0.197 | Perfect 1% | Zero 50% | 100% 多站点
+- #1 root cause: step budget exhaustion (449/739, 61%)
+- taostats 13%, stooq 20%, coingecko 27%
+- 4-site 83% budget exhausted | 3-site 0% perfect
+- 0 零导航得分任务 (无记忆化问题, 与 UID 228 不同)
+- Tipping point: 16 步后 scored rate 下降 19%
+- 新发现 action 分布: goto 67%, view_more 16%, type 4%, stop 4%, click 3%, click_role 3%
+
+### 迭代 21 (2026-03-19) — 交叉分析 + Action-by-outcome + 步数阈值修正 + parse_failed 检测
+
+**变更**:
+- [x] 新增 Section 5 "Classification × Navigation Root Cause" 交叉表
+  - completely_wrong 的 89% catch-all 拆解为: 51% budget_exhausted + 43% wrong_extraction + 6% never_visited
+  - 每个 wrong answer 都标记了 `_nav_root_cause` 供交叉分析
+- [x] 新增 Section 6 "Action type by outcome" 对比表
+  - goto (+3.34) 和 type_role (+0.11) 是正信号
+  - type (-0.72), scroll (-0.57), view_more (-1.42) 是负信号
+  - stop scored tasks = 1.0/task, zero = 0.83 (部分零分任务未执行 stop)
+- [x] 步数耗尽阈值修正: 从 total_steps>=20 改为 browser_steps>=25
+  - 新增 browser_steps 属性 (排除 stop action)
+  - Budget exhaustion 从 68%→44%，更准确反映 max_steps=30 限制
+  - 文档注释引用 liveweb-arena env.py max_steps=30
+- [x] 新增 PARSE_FAILED forensic flag: 检测 failure_reason 含 "parse" 的任务
+  - UID 153: 发现 24 个 parse_failed (8.2%)，全部 score=0，大多为 taostats 查询
+- [x] Forensic verdict 改进: 按类型分项 (parse failures / empty tasks / world-knowledge bypasses)
+
+**关键新发现**:
+- **parse_failed 占 8%**: 24/299 tasks 因解析失败得零分，这不是 agent 能力问题
+  - 大多是 taostats.io 复杂查询 (subnet 比较、百分比计算)
+  - 这些分数被错误计入 agent 的 zero-rate，如果排除，真实 zero-rate ~42% (而非 51%)
+- **completely_wrong 不再是黑盒**: 51% budget + 43% extraction + 6% no-visit
+- **type action 是负信号** (-0.72): 零分任务更多使用 type，可能在搜索框输入但未找到正确页面
+
+### 迭代 22 (2026-03-19) — TOP FINDINGS 纳入 parse_failed + adjusted zero-rate
+
+**变更**:
+- [x] TOP FINDINGS 新增环境问题发现:
+  - "32 tasks (11%) fail due to 24 parse failures + 8 empty tasks, not agent capability"
+  - 计算 adjusted zero-rate: 排除环境问题后 46% vs 原始 52% (差 6 个百分点)
+  - 这为用户提供了更准确的 agent 能力评估基线
+
+### 迭代 23 (2026-03-19) — Per-website action profile 全量展示
+
+**变更**:
+- [x] Per-website action patterns 重写为全量 action type 表格
+  - 自动筛选 >=1% 总量的 action type, 动态列
+  - goto 为 site-specific (只计目标站 URL), 其他 action 为 task-level
+  - 新增脚注说明 multi-site task 共享非 goto action 的计数
+- 关键发现:
+  - stooq: type=2.3 (在搜索框输入 ticker), goto=23.4 (过度导航), wait=0.6 (等页面加载)
+  - taostats: view_more=6.4 (数据展开), click_role=0.8 (accessibility click), goto=2.7 (少导航)
+  - coingecko: click_role=1.1 (最高), goto=20.3, type=0.0 (无搜索框交互)
+
+### 迭代 24 (2026-03-19) — Site-attributed action tracking + stop/wait 排除
+
+**变更**:
+- [x] `_parse_actions()` 重构: 追踪 `current_domain` (由最近 goto 设定)
+  - 新属性 `site_actions: dict[domain -> Counter]` 存储每站点 action 计数
+  - 内部 `_attribute()` helper 同时写入 global 和 site-specific 计数
+- [x] Per-website action profile 改用 site_actions 而非 task-level 计数
+  - 修复前: taostats type=0.8 (从 stooq 泄漏) → 修复后: type=0.0 (正确)
+  - 修复前: stooq view_more=0.1 (从 taostats 泄漏) → 修复后: 0.0 (正确)
+- [x] 排除 stop/wait 从 per-website 表 (task-termination/page-load, 非站点交互)
+
+**站点行为特征 (site-attributed)**:
+- taostats: view_more=6.4, click=0.9, scroll=1.0 (数据展开型)
+- stooq: goto=23.1, type=2.3 (搜索导航型)
+- coingecko: goto=20.3, click_role=1.1 (直接导航型)
+
+### 迭代 25 (2026-03-19) — Site-attributed winning/losing action 对比
+
+**变更**:
+- [x] Section 6b C per-website winning/losing 改用 site_actions
+  - 新增 `_site_action_avg()` 聚合每站点的 action 均值
+  - 自动筛选有意义的 action (>=0.3 avg) 并标记信号方向 (+/-/~)
+  - 排除 stop/wait (非站点交互)
+- 关键发现:
+  - stooq: `type w=1.6 l=2.3-` — 输掉的任务搜索更多但找到更少
+  - taostats: `goto w=4.0 l=2.7+` — 赢的任务主动导航到更多 subnet 页面
+  - coingecko: action profile 无显著差异 — 失败主要在提取不在导航
+
+**追加变更 (信号标记修正)**:
+- [x] 信号标记从绝对阈值改为相对差异 (delta/mean > 15%)
+  - 同时修复 Section 6 action-by-outcome 和 Section 6b C per-site patterns
+  - 修复前: taostats view_more 7.0 vs 6.5 标为 `+` (delta=0.5, abs>0.3)
+  - 修复后: 标为 `~` (delta/mean=7%, <15%)
+  - 修复前: click delta=-0.14 标为 `~` → 修复后: 标为 `-` (rel=19%, >15%)
+
+### 迭代 26 (2026-03-19) — 双阈值信号 + 报告精简 -20%
+
+**变更**:
+- [x] 信号标记改为双阈值: `rel > 15%` OR `abs(delta) >= 2.0`
+  - stooq goto: w=21.5 l=23.7 从 `~` → `-` (abs=2.2 ≥ 2.0, 符合 step-budget 逻辑)
+  - 同步修复 Section 6 和 Section 6b C 两处信号逻辑
+- [x] Forensics 精简: PARSE_FAILED/EMPTY_TASK 从逐条列出改为 compact summary
+  - 132 行 → ~15 行 (-88%), 报告总量 687→547 行 (-20%)
+  - summary 包含: count, avg steps, by-site breakdown, compact task ID list
+  - 高价值 flags (ZERO_INTERACTION, UNVISITED_CORRECT, VM_LOOP) 仍逐条展示
+  - 新发现: parse_failed 的 site 分布为 taostats(67), stooq(4), coingecko(4) — taostats 查询占绝对多数
+
+**对抗性不足 (迭代 27 待办)**:
+- Section 8 SFT STRATEGY (105 行) 是第二大 section，部分内容与 Section 7 OPT 重叠 (例如 multi-site navigation 同时出现在 OPT-1 和 SFT Strategy 1)。且 SFT Per-website recommendations 与 Section 3 Per-website accuracy 数据重复展示。应精简 SFT section 中与其他 section 重复的数据，只保留 SFT-specific 的 insight (数据来源/合成策略/MVD)。
 
 ### 迭代 16 (2026-03-17) — MVD 估算 + 环境代码级优化 + Session 精简
 

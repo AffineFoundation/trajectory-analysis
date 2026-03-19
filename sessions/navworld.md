@@ -1,6 +1,6 @@
 navworld 轨迹分析引擎迭代
 
-启动方式：/loop 10m navworld轨迹分析引擎迭代，读 sessions/navworld.md 比较脚本内容与目标差距 执行当前任务，提升脚本质量
+启动方式：/loop 15m navworld轨迹分析引擎迭代，读 sessions/navworld.md 比较脚本内容与目标差距 执行当前任务，提升脚本质量
 
 理解意图、设计方案、写代码、跑测试
 
@@ -18,6 +18,7 @@ navworld 轨迹分析引擎迭代
 5. 如果有任何 失败/成功的 pattern 深入分析
 6. 最开始给我 top findings 要求根据我分析报告背后的意图给出最优价值的 top findings
 7. 环境相关代码的提升点 理解环境背后设计意图 要求多角度充分论证，不得给出不扎实的意见
+8. 由于 USER_DAILY_QUERY_OVER_LIMIT 访问失败导致的task/ 或者类似对端原因导致 api 访问失败的 task ids 要给出并且在 top findings
 
 
 每次迭代工作流
@@ -1003,11 +1004,228 @@ Good+ trades around_search (-0.6) → search_flights (+0.6) + search_train_ticke
 
 **不足**: task 898669235 (24K chars, score 0) 的 HC failure 是 format_valid + poi_names_verified。24K 字符的输出如何 format_valid 失败? 可能原因: (1) 输出结构不符合要求的旅行方案格式 (2) 内容过长且混乱。需 deep dump 确认, 但作为监测迭代不深入。
 
+### 迭代 50 (2026-03-19) — F2 ghost 一致性 + Section 4 交叉引用 bug ✅
+- [x] F2 (TOP FINDINGS: TOOL DIVERSITY + TOOL EFFICIENCY) 的 Good+ gap 从 `good_tasks` 切换到 `s3_good`
+  - 与 Section 3/8.2/10.1/A2/A3 全部一致使用 ghost-excluded Good+
+  - UID 78: F2 Good+ avg 从 3.7 (含 ghost) 修正为真实值
+- [x] 修复 Section 4 MONO_TOOL 交叉引用 bug: "see F8" → "see MONO_TOOL in TOP FINDINGS"
+  - MONO_TOOL Finding 编号因其他 findings 触发/不触发而变化 (F6/F7/F8 均可能)
+  - 硬编码 "F8" 在 UID 71 中错误 (实际是 F7)
+- [x] 跑 UID 71/142/78 验证: 3 矿工全部通过
+
+**迭代 50 结果 (UID 71, recent 30)**:
+- avg=4.9, 3% good+, 93% poor — VERY WEAK, improving (+7)
+- POI err **100%** — 全量 API 故障期数据 (15/30 API-blocked)
+- F2: r=0.711 (最强工具多样性相关), Good+ 5.0 vs Poor 2.5 (+2.5) — ghost-excluded (0 ghost in Good+)
+- 开局: 90% 用 `poi_search×3` (avg=3.3), 仅 10% 用 transport-first (avg=18.6) → +15 pts gap
+- A1 = 开局策略 (+15 pts), A3 = "stop retrying" (100% err), A4 = 增加 direction/weather/transport (+54-86pp)
+- 交叉引用: "(all 15 are API-blocked — see MONO_TOOL in TOP FINDINGS)" — 不再硬编码 F8
+
+**不足**: UID 71 仅 1 个 Good+ task (n=1), 所有 Good+ vs Poor 比较都基于单一任务。小样本警告 "⚠ small Good+ sample (n=1)" 存在但对读者来说可能不够醒目 — 当 n=1 时所有 adoption gap/frequency delta/opening gap 都是单任务噪声。考虑当 n=1 时在 SFT Action Plan 中降级建议优先级或添加 "⚠ based on single task" 标注。但这可能导致大多数矿工的 action plan 变得太保守 (很少有矿工 Good+ > 2)。
+
+### 迭代 49 (2026-03-19) — Good+ 比较排除 ghost high-scorers ✅
+- [x] Section 3 Tool Usage + SFT Action Plan A2/A3: Good+ vs Poor 比较排除 ghost high-scorers
+  - Ghost 的工具使用模式来自 think blocks (非真实用户策略), 污染 Good+ 基线
+  - 新增 `s3_good` (ghost-excluded Good+) 在 pre-compute 阶段创建, 全局使用
+  - 影响: Tool diversity, adoption gap, call frequency, OVER/UNDER-CALLED signals, A2, A3 全部使用 ghost-excluded Good+
+  - 显示 "(excl. N ghost)" 注释, 与 Section 8.2/10.1 一致
+- [x] 跑 UID 78/15 验证
+
+**迭代 49 结果 (UID 78, recent 30, 60% think-only)**:
+- 6 Good+ → 3 real Good+ (排除 3 ghost high-scorers)
+- **关键修正** (ghost 排除前后对比):
+  - total_calls: 11.5 → **8.0** — ghost 任务永远打满 15 次调用上限, 虚高 Good+ calls
+  - poi_search freq: 5.3 → **3.3** — ghost 在 think block 中反复调 poi_search
+  - A3 poi_search target: (8→5) → **(8→3)** — 推荐更准确的目标
+  - search_train adoption gap: -33pp → **-17pp** — ghost 不用 transport, 虚拉偏 adoption
+- UID 15 (0% think-only): 无变化 (0 ghost, s3_good = good_tasks) — 回归通过
+
+**不足**: F2 (TOOL DIVERSITY) 的 Good+ vs Poor gap 仍使用原始 `good_tasks` (含 ghost), 因为 F2 是在 TOP FINDINGS 中用 pre-computed `good_tasks`。但 F2 的信息 ("Good+ avg unique tools: 3.7 vs Poor: 3.7 Gap: +0.0") 现在与 Section 3 的 ghost-excluded 数据不一致。影响有限 (F2 重点是 r 值, gap 是补充), 但理想情况下 F2 也应使用 s3_good。
+
+### 迭代 48 (2026-03-19) — 开局策略→SFT 行动计划 + 可疑低分阈值放宽 ✅
+- [x] 开局策略 gap 整合到 SFT Action Plan: 当检测到 gap > 10 pts 时, 作为 A1 (最高优先级) 输出
+  - "A1. [HIGH] Switch opening strategy: 'best_opening' (avg=X) instead of 'common_opening' (avg=Y)"
+  - "+N pts score gap — highest single-change impact"
+  - 无 gap 时: A1 仍是 Score bottleneck (原逻辑)
+- [x] 可疑低分检测 (Section 7.2) 放宽 error_rate 阈值: 0.10 → 0.30
+  - 修复: 高工具多样性 + 20% 错误率的任务未被检出 (如 uniq=4, err=20%, score=14.5, all HC pass)
+  - UID 78: 新增检出 task 426301014 (4 unique, 20% err, all pass, code=13.3, llm=1.4 — LLM 瓶颈)
+- [x] 跑 UID 60/162/78/142 验证: 4 矿工全部通过
+
+**迭代 48 结果 (UID 60, recent 30, 非 reasoning model)**:
+- avg=12.0, 13% good+, 77% poor — VERY WEAK → adj. WEAK (avg=15.1, excl. 8 API-blocked)
+- **A1 (开局策略)**: "'poi_search → poi_search → weather' (avg=39) instead of 'weather → poi_search → poi_search' (avg=3)" — +36 pts gap
+- **A2 (Score bottleneck)**: LLM 10% vs code 17%
+- **A3**: poi_search OVER-CALLED + API failure causal (91% err)
+- **A4**: search_flights/trains 推荐, around_search 跳过 (94% err)
+- 可疑低分: 5 tasks (新增 483886759: uniq=4, err=13%, all pass, score=12.2)
+- UID 78: A1 = Score bottleneck (无开局 gap), 可疑低分新增 task 426301014 (err=20% 被放宽后检出)
+- UID 162: A1 = 开局策略 (+24 pts), transport-first opening 48x 更优
+- UID 142: 开局 gap +18 pts, `search_flights → search_train_tickets → weather` avg=23.8
+
+**不足**: 开局 gap 检测的最佳替代开局要求 n>=2, 但 n=2 的 avg 仍可能是噪声。如 UID 60 的 `poi_search → poi_search → weather` avg=39.4 (n=2) — 如果两个任务恰好都是容易类型, 39.4 可能是偶然。但降低到 n>=3 会导致大多数矿工无法触发检测 (开局种类多, 每种 n 很小)。n=2 是可接受的折中。
+
+### 迭代 47 (2026-03-19) — 开局策略差距自动检测 ✅
+- [x] Section 3 Opening sequences 新增 **OPENING STRATEGY GAP** 自动检测
+  - 当最常用开局 avg score < 替代开局 avg score - 10 pts (且替代开局 >= 2 次使用): 触发警告
+  - 输出: 最常用 vs 最佳开局的分数差距, 使用次数, 倍数
+  - 检测 transport-first 开局: 当最佳开局以 search_flights/search_train_tickets 开头时, 推荐 "train this as default opening"
+  - 阈值: gap > 10 pts, 替代开局 n >= 2 (防止单次任务噪声)
+- [x] 跑 UID 162/15/78/142 验证: 4 矿工全部通过
+
+**迭代 47 结果 (UID 162, recent 30)**:
+- avg=8.1, 7% good+, 90% poor — VERY WEAK, declining (-6)
+- **OPENING STRATEGY GAP**: `poi_search×3` avg=0.5 vs `search_flights → search_train_tickets → poi_search` avg=25.4 (+25 pts, **48x**)
+  - 43% 的任务使用最差开局, 仅 23% 使用最佳开局
+  - 这是报告中最可操作的单一洞察: 仅改变开局工具就可能大幅提升分数
+- UID 15 (健康 API): +12 pts gap (11.8 vs 23.6, 2x) — 即使 API 健康, transport-first 仍更优
+- UID 78 (健康 API): 无 gap — `poi_search×3` avg=23.5 已是最优 (API 健康时 poi_search 开局可行)
+- UID 142: +18 pts gap (5.6 vs 23.8) — transport-first 4x 更优
+
+**关键洞察**: 开局策略差距与 API 健康度交互:
+- API 不健康 (>50% err): transport-first 开局优势巨大 (25-48x), 因为 poi_search 必定失败
+- API 健康 (<10% err): poi_search 开局也可行 (UID 78 avg=23.5), 但 transport-first 仍有 2x 优势 (UID 15)
+- API 完全健康 + 强模型: poi_search 开局可能成为最优 (UID 78 无 gap)
+
+**不足**: OPENING STRATEGY GAP 仅在 Section 3 中显示, 未整合到 SFT Action Plan (A1-A5) 或 Section 10.1 Optimal Tool Sequence。当 10.1 因 "insufficient good+ data" 跳过时, Section 3 的开局 gap 是唯一的开局策略信号, 但它的位置在报告中段, 可能被读者忽略。考虑在 SFT Action Plan 中引用 Section 3 的 gap 发现。
+
+### 迭代 46 (2026-03-19) — A2 因果解释 + Section 4 MONO_TOOL 一致性 ✅
+- [x] A2 (Reduce repetitive calls) 新增因果解释, 基于工具错误率区分两种原因:
+  - err>50%: "Cause: API failures (N% err) — stop retrying after 1-2 failures, switch to other tool types"
+  - err<=50%: "Good+ tasks diversify earlier — redirect budget to transport/weather tools"
+  - 混合: 分别说明各工具原因
+- [x] Section 4 MONO_TOOL 新增 API-blocked 分解, 与 TOP FINDINGS F8 保持一致
+  - 全部 API-blocked: "(all N are API-blocked — see F8)"
+  - 混合: "(N API-blocked + M strategy-driven)"
+- [x] 跑 UID 15/71/78 验证: 3 矿工全部通过
+
+**迭代 46 结果 (UID 15, recent 25, 健康 API)**:
+- avg=10.4, 8% good+, 80% poor — VERY WEAK, stable
+- POI err 仅 10% — 无 API-blocked 任务, 无 adj score (正确)
+- **A2**: "poi_search (5→2)" + "Good+ tasks diversify earlier" — 策略解释 (正确: 10% err)
+- **MONO_TOOL**: 2/25 (8%), 无 API-blocked breakdown (正确: 0% err tasks are strategy-driven)
+- **Most predictive step**: step 4 (r=0.428, n=20) — 正确跳过 step 7 (r=0.632, n=12 ⚠)
+- 特征: Code 19% vs LLM 7% — 最大 code/LLM 差距之一; 18/25 code-dominated
+- 0% think-only, 20% no_think — 非 reasoning model 占 20%
+- UID 71 (95% err): A2 正确切换到 "Cause: API failures — stop retrying"
+- UID 78 (5% err): A2 正确使用 "diversify earlier", MONO 无 API breakdown
+
+**不足**: UID 15 的 Code/LLM 差距极大 (19% vs 7%), 但 F4 (Code/LLM Balance) 只说 "SFT should focus on output format + reasoning connectors + analysis depth"。当 LLM 利用率 < 10% 时, 这个建议过于笼统 — LLM 分数如此低可能意味着模型输出缺乏基本的结构化格式 (sections/headers), 导致 LLM judge 给出极低分。更精细的诊断应该区分 "LLM 低是因为格式差" vs "LLM 低是因为推理浅" vs "LLM 低是因为事实错误", 但这需要解析 LLM judge 的 5 维评分 (practicality, logic, analysis_depth, user_experience, factual_grounding), 而当前 score_breakdown 中没有这些维度细分 (仅有 noisy_llm 聚合值)。
+
+### 迭代 45 (2026-03-19) — 预测步骤选择可靠性 + MONO_TOOL 根因分解 ✅
+- [x] 修复 "Most predictive step" 选择: 优先选择 n>=20 的步骤
+  - 之前: 纯 |r| 最高 (step 11 r=0.943 n=11 ⚠) — 小样本噪声
+  - 之后: 优先 n>=20 步骤 (step 5 r=0.563 n=22) — 可靠
+  - 逻辑: n>=20 可靠步骤始终优先; 两者都可靠时选 |r| 更高; 两者都不可靠时选 |r| 更高 (min n=10)
+- [x] F8 MONO_TOOL 新增 API-blocked vs strategy 分解
+  - 当所有 MONO 都是 API-blocked: "All N are API-blocked — model couldn't diversify due to API failures, not strategy"
+  - 当混合时: "N API-blocked (couldn't diversify) + M strategy (chose not to diversify)"
+  - 帮助读者区分 "环境导致无法多样化" vs "模型策略选择不多样化"
+- [x] 跑 UID 142/78/71/60 验证: 4 矿工全部通过
+
+**迭代 45 结果 (UID 142, recent 30)**:
+- avg=6.9, 7% good+, 83% poor — VERY WEAK, declining (-12)
+- **Most predictive step**: step 5 (r=0.563, n=22) — 取代了 step 11 (r=0.943, n=11 ⚠)
+  - Step 5 对应模型开始发起第 5 次工具调用时的奖励, 通常是开始多样化工具的时间点
+- **MONO_TOOL**: 11/30 (37%), **全部 11 个都是 API-blocked** — 不是模型策略问题
+  - 解读: poi_search 90% 错误率 → 模型反复重试 → 无法切换到其他工具 → MONO_TOOL
+- UID 78 (健康 API): 2 MONO_TOOL, 无 breakdown 行 (都是策略选择, 非 API-blocked) — 正确
+- UID 71: 13 MONO_TOOL, 全部 API-blocked — 正确
+- UID 60: Most predictive step 3 (r=0.630, n=22), 取代了 step 6 (r=0.653, n=17 ⚠) — 正确
+
+**不足**: MONO_TOOL 在 Section 4 (Overfitting Detection) 中有独立统计但没有 API-blocked 分解, 仅在 TOP FINDINGS F8 中有分解。两处信息不一致 — Section 4 可能让读者认为 MONO_TOOL 全部是策略问题。但 Section 4 是详细区域, 读者通常会先看 TOP FINDINGS 的总结, 影响有限。
+
+### 迭代 44 (2026-03-19) — F4/F11 合并 + API-adjusted Executive Summary + A3 高错误率过滤 ✅
+- [x] 合并 F4 (POI API FAILURE) 与 F11 (API-BLOCKED TASKS) 为单一 Finding
+  - 当 avg_poi_err>15% 且有 api_blocked tasks: 输出合并的 "POI API FAILURE: N% — M/N tasks API-blocked" + task IDs
+  - 当 avg_poi_err>15% 但无 blocked tasks: 输出原 F4
+  - 当 avg_poi_err<=15% 但有 blocked tasks: 输出独立 F11
+  - 消除了两个 Finding 同时出现时的冗余
+- [x] Executive Summary 新增 **API-adjusted score**
+  - 当 API-blocked tasks >= 15% 时: 计算排除 blocked 任务后的 adj. avg 和 adj. perf_label
+  - 标签变化时: "VERY WEAK → adj. WEAK (avg=15.5, excl. 11 API-blocked)"
+  - 标签不变时: "[adj. avg=14.0 excl. 11 API-blocked]"
+  - 帮助读者区分 "模型差" vs "API 差导致模型分低"
+- [x] A3 (Increase adoption) **过滤高错误率工具** (>50%)
+  - 修复矛盾: Section 3 警告 "caution: 100% err — more calls may not help" 但 A3 仍推荐 "increase adoption"
+  - 高错误率工具从推荐列表移除, 显示 "Skipped (high error rate): tool (N% err)"
+- [x] 跑 UID 71/78/60/162 验证: 4 矿工全部通过
+
+**迭代 44 结果 (UID 71, recent 25)**:
+- avg=7.8, 8% good+, 84% poor — VERY WEAK, declining (-7)
+- **Executive Summary**: `VERY WEAK (avg=7.8) [adj. avg=14.0 excl. 11 API-blocked]` — 标签不变但显示真实能力
+- **F3 (合并)**: "POI API FAILURE: 85% — 11/25 tasks API-blocked" + 10 task IDs — 单一 Finding 覆盖 rate + IDs
+- **A3**: "Increase adoption of: direction (+67pp), weather (+67pp), search_flights (+40pp), search_train_tickets (+45pp)" — **around_search (100% err) 被正确跳过**
+- UID 78 (健康 API): 无 F4/F11, 无 adj score, around_search 正常推荐 (低 err) — 回归通过
+- UID 60: around_search (94% err) 跳过, search_flights/trains 正常推荐 — 回归通过
+- UID 162: "VERY WEAK → adj. WEAK (avg=15.5, excl. 11 API-blocked)" — 标签升级正确
+
+**不足**: A2 (Reduce repetitive calls) 推荐 "poi_search (9→4)" 但未解释因果机制 — Good+ 调用更少 poi_search 是因为更早切换到 transport 工具 (step 2-3), 而非因为 poi_search 本身不必要。当前描述 "Good+ tasks call fewer times" 是相关性描述, 非因果。此外 poi_search 有 93% 错误率, 减少调用不是策略问题而是 "API 失败后应停止重试" — 但 A2 的措辞未区分这两种原因。
+
+### 迭代 43 (2026-03-19) — Goal 8: API-BLOCKED 任务 ID 列表 + 错误分类 ✅
+- [x] 审计 affinetes/environments/qqr/ 源码: 无 USER_DAILY_QUERY_OVER_LIMIT 特定字符串, 使用通用 error keywords
+- [x] `_parse_tools` 新增错误分类: api_error, timeout, empty, tool_error (从通用 is_error 升级)
+  - api_error: "Error executing tool", "API response", "rate limit", "over_limit", "quota", "forbidden", "429" 等
+  - timeout: "timeout", "超时", "timed out"
+  - empty: 空结果 / null / {}
+  - tool_error: entry.get("error") 标记
+- [x] 新增 `is_api_blocked` 属性: >80% 调用失败 (api_error + timeout) 且 total_calls > 0
+- [x] 新增 **F11: API-BLOCKED TASKS** — TOP FINDINGS 中列出 task IDs (最多 10 个)
+  - 每个 task: task_id, score, err%, api/infra 错误数, type
+  - Error type breakdown (跨所有 blocked tasks 汇总)
+  - 建议: "Exclude from model evaluation or re-run after API fix"
+- [x] ALL TASKS 表新增 `A` 标记 (api_blocked + score<15)
+- [x] 跑 UID 162/142/78/60 验证: 4 矿工全部通过
+  - UID 162: 11/25 API-blocked (87% avg POI err) — 正确检出
+  - UID 142: 12/20 API-blocked (含老数据) — 正确检出
+  - UID 78: 0 API-blocked (5% err, 健康) — 正确不触发
+  - UID 60: 7/25 API-blocked (74% avg POI err) — 正确检出
+
+**迭代 43 结果 (UID 60, recent 25, 非 reasoning model)**:
+- avg=12.4, 12% good+, 76% poor — VERY WEAK, declining (-7)
+- F8 (API-BLOCKED): 7/25 tasks, 全部 87-100% api_error, 全部 score < 8
+- Error type breakdown: 100% api_error (无 timeout, 无 empty — 全部是 "Error executing tool" 类)
+- around_search UNDER-CALLED + 91% err caveat 正确触发
+- poi_search OVER-CALLED (6.1→4.7) 正确检出
+- 非 reasoning model: 64% no_think, 1 synth-fail, 1 think-only (4%)
+- Good+ profile: unique=5.3, calls=15, err=27% — 低错误+高多样性
+
+**Goal 8 实现状态**: ✅ 完成
+- API 失败 task IDs 列表: 在 TOP FINDINGS 中自动输出 (F11/F8/F9, 编号随触发顺序)
+- 错误分类: api_error, timeout, empty, tool_error
+- 跨矿工验证: 高 API 错误矿工正确检出, 健康矿工正确不触发
+
+**不足**: F11 (API-BLOCKED) 与 F4 (POI API FAILURE) 存在信息重叠 — 当两者同时触发时, F4 报告整体错误率, F11 列出具体 task IDs。两者互补但读者可能觉得冗余。此外, 80% 阈值是硬编码的, 75% 错误率的任务 (如 UID 60 task 643061465, err=75%, score=0.2) 不被标记为 API-blocked, 但其失败仍主要由 API 驱动。可考虑降至 70% 或改用动态阈值 (如该矿工 median error rate * 1.5)。
+
+### 迭代 42 (2026-03-19) — 工具信号与误差率交叉验证 + 小样本警告 + 零工具排除 ✅
+- [x] 审读 UID 162 recent 25 完整报告 (428行), 发现 3 个误导性输出
+- [x] 修复 1: Section 3 UNDER-CALLED/OVER-CALLED 信号交叉引用工具误差率
+  - UNDER-CALLED + err>50%: 追加 "(caution: tool has N% error rate — more calls may not help)"
+  - OVER-CALLED + err<10%: 追加 "(note: tool has low error rate N% — calls may be justified)"
+- [x] 修复 2: Section 8.1 "Without errors" 排除 ZERO_TOOLS 任务 (0 calls=0 errors 不代表 clean execution)
+  - 新增 "Zero-tool tasks: N (excluded)" 行
+- [x] 修复 3: Good+ vs Poor 比较添加小样本警告 (n<5 时 "⚠ small Good+ sample (n=N)")
+- [x] 移除未使用的 `import math`
+- [x] 跑 UID 162/142/71 验证通过
+
+**迭代 42 结果 (UID 162, recent 25)**:
+- avg=9.0, 8% good+, 88% poor — VERY WEAK, declining (-10)
+- POI err 87% (环境问题, 非模型问题)
+- **修复验证**:
+  - poi_search UNDER-CALLED 信号正确追加 "caution: 90% error rate" — 避免推荐增加失败工具调用
+  - weather OVER-CALLED 信号正确追加 "note: 0% error rate" — 提醒减少可能不合理
+  - Zero-tool tasks (2) 从 "without errors" 分离 — 不再误报为 "clean avg=0.0"
+  - small Good+ sample (n=2) 警告正确显示
+- **UID 71**: around_search UNDER-CALLED + 98% err → caution 正确触发
+- **UID 142**: n=1 good+ → small sample 警告; 无 OVER/UNDER-CALLED + err caveats (健康 API, 正确)
+
+**不足**: 工具频次 OVER/UNDER-CALLED 信号仅基于 Good+ vs Poor 频次差异, 但当 Good+ 和 Poor 的类型分布不同时 (如 Good+ 全部是 business, Poor 是混合类型), 频次差异可能是类型组成效应而非策略差异。理想的做法是按类型分组后计算频次差异, 但这会导致每组样本量过小 (n<3) 无法得出可靠结论。当前的小样本警告部分缓解了此问题。
+
 ## 项目完成总结
 
 | 产出 | 描述 |
 |------|------|
-| `scripts/analyze_navworld.py` (2342行, 源码重建+增强) | Executive Summary + TOP FINDINGS (F1-F10) + 10-section 分析 + 工具频次(OVER/UNDER-CALLED, BUDGET SINK) + suspicious underscorers (含巨量输出零分) + SFT action plan + deep dump + 编造按类型 + ghost 全面排除 (Q10 已修复) |
+| `scripts/analyze_navworld.py` (2564行, 源码重建+增强) | Executive Summary (含 API-adjusted score) + TOP FINDINGS (F1-F11 合并+ghost-excluded, API-BLOCKED IDs, MONO_TOOL 根因分解) + 10-section 分析 + 开局策略差距→A1 + 工具频次(OVER/UNDER-CALLED+误差率交叉验证, BUDGET SINK, ghost-excluded Good+) + 错误分类 + 可疑低分 + SFT action plan (开局策略/因果解释/高错误率过滤/ghost-excluded) + 可靠预测步骤选择 + deep dump + 编造按类型 + ghost 全面排除 |
 | `scripts/detect_think_blocks.py` (~330行) | Think-block 漏洞检测 + 量化 + 跨矿工对比 |
 | `scripts/synth_navworld_sft.py` (~420行) | SFT 训练数据提取, 质量评分, transport grounding |
 | `scripts/verify_navworld_sft.py` (~220行) | 离线 HC 评分验证 |

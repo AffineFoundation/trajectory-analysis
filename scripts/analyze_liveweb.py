@@ -32,15 +32,29 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # ── Constants ────────────────────────────────────────────────────────────────
 
 # Known websites that appear in LIVEWEB tasks
+# Active LiveWeb Arena plugin sites (from liveweb-arena repo, 2026-03-19)
+# hybrid plugin combines coingecko + stooq, weather plugin (wttr.in) disabled
 KNOWN_SITES = [
-    "stooq.com", "taostats.io", "coinmarketcap.com", "coingecko.com",
-    "finance.yahoo.com", "tradingview.com", "investing.com",
-    "marketwatch.com", "stockanalysis.com", "macrotrends.net",
-    "companiesmarketcap.com", "statista.com", "worldometers.info",
-    "duckduckgo.com", "google.com", "bing.com",
-    "openlibrary.org", "news.ycombinator.com",
-    "weather.com", "openweathermap.org",
+    "stooq.com", "taostats.io", "coingecko.com",
+    "news.ycombinator.com", "openlibrary.org",
 ]
+
+# Legacy/external sites that may appear in goto URLs but are NOT plugin sites
+# Kept for domain extraction fallback (agent may navigate to these)
+KNOWN_EXTERNAL_SITES = [
+    "coinmarketcap.com", "finance.yahoo.com", "tradingview.com",
+    "investing.com", "marketwatch.com", "stockanalysis.com",
+    "macrotrends.net", "companiesmarketcap.com", "statista.com",
+    "worldometers.info", "duckduckgo.com", "google.com", "bing.com",
+    "weather.com", "openweathermap.org", "wttr.in",
+]
+
+# Domains that look like websites but are actually crypto/project names
+# mentioned in questions — not real LiveWeb plugin sites.
+FALSE_POSITIVE_DOMAINS = {
+    "fetch.ai", "xen.com", "render.com", "near.org",
+    "polygon.technology", "cosmos.network",
+}
 
 # Question type classification patterns
 _QUESTION_TYPE_PATTERNS = [
@@ -68,12 +82,18 @@ _QUESTION_TYPE_PATTERNS = [
                  r"\bexchange rate\b", r"\bconversion\b"]),
 ]
 
-# Browser action patterns in conversation
+# Browser action patterns in conversation (fallback regex for non-tool-call formats)
 _ACTION_PATTERNS = {
     "goto": re.compile(r'goto\s*\(\s*["\']([^"\']+)["\']\s*\)', re.IGNORECASE),
     "click": re.compile(r'click\s*\(', re.IGNORECASE),
     "scroll": re.compile(r'scroll\s*\(', re.IGNORECASE),
     "view_more": re.compile(r'view_more', re.IGNORECASE),
+}
+
+# All action types from liveweb-arena agent_protocol.py
+_ALL_ACTION_NAMES = {
+    "goto", "click", "scroll", "view_more", "type", "press",
+    "wait", "click_role", "type_role", "stop",
 }
 
 # Wrong answer sub-classification keywords
@@ -164,6 +184,9 @@ def _extract_websites_from_question(question_text):
     for m in domain_pattern.finditer(question_text.lower()):
         domain = m.group(1)
         if domain in domains or domain.startswith("e.g"):
+            continue
+        # Filter out false positive domains (crypto names that look like domains)
+        if domain in FALSE_POSITIVE_DOMAINS:
             continue
         # Filter out false positives: must have at least 4 chars before TLD
         # or be a known site
@@ -312,6 +335,8 @@ class TrajectoryData:
         self.goto_domains = []
         self.action_counts = Counter()
         self.url_loops = []
+        # Per-site action attribution: domain -> Counter(action_type -> count)
+        self.site_actions = defaultdict(Counter)
         self._parse_actions()
 
         # Derived: navigation metrics
@@ -322,6 +347,10 @@ class TrajectoryData:
         self.is_zero = abs(self.score) < 1e-6
         self.is_multi_site = self.num_subtasks >= 2
         self.total_steps = sum(self.action_counts.values())
+        # Browser steps: actions counted against step budget (excludes stop)
+        self.browser_steps = sum(
+            v for k, v in self.action_counts.items() if k != "stop"
+        )
         self.unique_urls = len(set(self.goto_urls))
         self.url_diversity = (self.unique_urls / len(self.goto_urls)
                               if self.goto_urls else 0.0)
@@ -389,7 +418,19 @@ class TrajectoryData:
         Actions are stored as OpenAI-style tool_calls on assistant messages:
           msg["tool_calls"] = [{"function": {"name": "goto", "arguments": '{"url": "..."}'}}]
         Also falls back to regex matching on content text for other formats.
+
+        Tracks current_domain (set by each goto) to attribute non-goto actions
+        to the site being browsed at that moment (stored in self.site_actions).
         """
+        current_domain = ""  # tracks which site the agent is currently on
+
+        def _attribute(action_name, domain=None):
+            """Record action in both global counts and site-specific counts."""
+            self.action_counts[action_name] += 1
+            target = domain or current_domain
+            if target:
+                self.site_actions[target][action_name] += 1
+
         for msg in self.conversation:
             if msg.get("role") != "assistant":
                 continue
@@ -402,7 +443,6 @@ class TrajectoryData:
                 args_str = func.get("arguments", "{}")
 
                 if name == "goto":
-                    self.action_counts["goto"] += 1
                     try:
                         args = json.loads(args_str) if isinstance(args_str, str) else args_str
                         url = args.get("url", "")
@@ -413,12 +453,12 @@ class TrajectoryData:
                         domain = _extract_domain(url)
                         if domain:
                             self.goto_domains.append(domain)
-                elif name == "click":
-                    self.action_counts["click"] += 1
-                elif name == "scroll":
-                    self.action_counts["scroll"] += 1
+                            current_domain = domain
+                    _attribute("goto", current_domain)
                 elif name in ("view_more", "viewmore"):
-                    self.action_counts["view_more"] += 1
+                    _attribute("view_more")
+                elif name in _ALL_ACTION_NAMES:
+                    _attribute(name)
 
             # Fallback: regex on content text (for non-tool-call formats)
             content = str(msg.get("content", "") or "")
@@ -429,10 +469,14 @@ class TrajectoryData:
                     domain = _extract_domain(url)
                     if domain:
                         self.goto_domains.append(domain)
-                    self.action_counts["goto"] += 1
-                self.action_counts["click"] += len(_ACTION_PATTERNS["click"].findall(content))
-                self.action_counts["scroll"] += len(_ACTION_PATTERNS["scroll"].findall(content))
-                self.action_counts["view_more"] += len(_ACTION_PATTERNS["view_more"].findall(content))
+                        current_domain = domain
+                    _attribute("goto", current_domain)
+                for _ in _ACTION_PATTERNS["click"].findall(content):
+                    _attribute("click")
+                for _ in _ACTION_PATTERNS["scroll"].findall(content):
+                    _attribute("scroll")
+                for _ in _ACTION_PATTERNS["view_more"].findall(content):
+                    _attribute("view_more")
 
         # Detect URL loops (>=3 consecutive identical goto URLs)
         if len(self.goto_urls) >= 3:
@@ -463,8 +507,11 @@ class TrajectoryData:
         return matched / len(self.required_sites) if self.required_sites else 1.0
 
     def _detect_step_budget_exhaustion(self):
-        """Heuristic: if total steps > 20 and score < 1.0, likely exhausted budget."""
-        return self.total_steps >= 20 and not self.is_perfect
+        """Heuristic: if browser steps >= 25 and score < 1.0, likely exhausted budget.
+        Threshold 25 chosen because liveweb-arena max_steps defaults to 30,
+        and tasks hitting 25+ browser actions are near or at the limit.
+        """
+        return self.browser_steps >= 25 and not self.is_perfect
 
     @property
     def has_loops(self):
@@ -690,23 +737,28 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
     budget_exhausted_pre = [t for t in parsed if t.step_budget_exhausted]
     loop_tasks_pre = [t for t in parsed if t.has_loops]
 
-    # Navigation-aware root cause pre-compute
+    # Navigation-aware root cause pre-compute (per wrong answer)
     rc_budget = 0
     rc_wrong_extract = 0
     rc_never = 0
     rc_no_nav = 0
+    # Tag each wrong answer with its navigation root cause for cross-analysis
     for t in parsed:
         for wa in t.wrong_answers:
             site_lower = wa["website"].lower()
             visited = any(site_lower in d or d in site_lower for d in t.goto_domains)
             if t.action_counts.get("goto", 0) == 0:
                 rc_no_nav += 1
+                wa["_nav_root_cause"] = "no_navigation"
             elif not visited:
                 rc_never += 1
+                wa["_nav_root_cause"] = "never_visited"
             elif t.step_budget_exhausted:
                 rc_budget += 1
+                wa["_nav_root_cause"] = "budget_exhausted"
             else:
                 rc_wrong_extract += 1
+                wa["_nav_root_cause"] = "wrong_extraction"
 
     total_wrong_pre = sum(len(t.wrong_answers) for t in parsed)
 
@@ -788,6 +840,27 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
             findings.append(
                 f"3+ site tasks: 0/{len(three_plus)} perfect — structurally unsolvable at current capability"
             )
+
+    # Finding: Parse failures (environment issue)
+    parse_failed_tasks = [t for t in parsed
+                          if t.failure_reason and "parse" in str(t.failure_reason).lower()]
+    empty_tasks = [t for t in parsed if t.num_subtasks == 0]
+    env_issue_count = len(parse_failed_tasks) + len(empty_tasks)
+    if env_issue_count >= 3:
+        adj_zero = zero_count - len([t for t in parse_failed_tasks if t.is_zero]) \
+                   - len([t for t in empty_tasks if t.is_zero])
+        adj_n = n - env_issue_count
+        adj_rate = adj_zero / adj_n * 100 if adj_n > 0 else 0
+        parts = []
+        if parse_failed_tasks:
+            parts.append(f"{len(parse_failed_tasks)} parse failures")
+        if empty_tasks:
+            parts.append(f"{len(empty_tasks)} empty tasks")
+        findings.append(
+            f"Environment issues: {env_issue_count} tasks ({env_issue_count / n * 100:.0f}%) "
+            f"fail due to {' + '.join(parts)}, not agent capability "
+            f"(adjusted zero-rate: {adj_rate:.0f}% vs raw {zero_rate:.0f}%)"
+        )
 
     # Finding: Token waste
     perf_tok = [t.total_tokens for t in perfect_tasks if t.total_tokens > 0]
@@ -1090,7 +1163,7 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
         # Step budget analysis
         p("  Step budget analysis:")
         budget_exhausted = [t for t in parsed if t.step_budget_exhausted]
-        p(f"    Budget exhausted (>=20 steps, imperfect): {len(budget_exhausted)}/{n} ({len(budget_exhausted) / n * 100:.0f}%)")
+        p(f"    Budget exhausted (>=25 browser steps, imperfect): {len(budget_exhausted)}/{n} ({len(budget_exhausted) / n * 100:.0f}%)")
         if budget_exhausted:
             p(f"    Avg steps (exhausted): {_safe_mean([t.total_steps for t in budget_exhausted]):.1f}")
             p(f"    Avg score (exhausted): {_safe_mean([t.score for t in budget_exhausted]):.3f}")
@@ -1111,6 +1184,8 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
     all_wrong = []
     for t in parsed:
         all_wrong.extend(t.wrong_answers)
+    cw_answers = [w for w in all_wrong if w["classification"] == "completely_wrong"]
+    cw_sub = Counter(w["sub_class"] for w in cw_answers)
 
     total_subtasks = sum(t.num_subtasks for t in parsed)
     total_correct = total_subtasks - len(all_wrong)
@@ -1128,10 +1203,8 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
         p("")
 
         # completely_wrong breakdown
-        cw_answers = [w for w in all_wrong if w["classification"] == "completely_wrong"]
         if cw_answers:
             p("  completely_wrong breakdown:")
-            cw_sub = Counter(w["sub_class"] for w in cw_answers)
             for sub, cnt in cw_sub.most_common():
                 p(f"    {sub:<25} {cnt:>4} ({cnt / len(cw_answers) * 100:>5.1f}%)")
             p("")
@@ -1189,6 +1262,59 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
         p("    (See SFT IMPROVEMENT PRIORITY RANKING for actionable breakdown)")
         p("")
 
+        # Cross-tabulation: wrong answer classification × navigation root cause
+        p("  Classification × Navigation Root Cause:")
+        nav_causes = ["budget_exhausted", "wrong_extraction", "never_visited", "no_navigation"]
+        nav_cause_labels = {
+            "budget_exhausted": "budget",
+            "wrong_extraction": "extract",
+            "never_visited": "no_visit",
+            "no_navigation": "no_nav",
+        }
+        # Collect unique classifications that matter
+        class_counts = Counter(w["classification"] for w in all_wrong)
+        top_classes = [cls for cls, _ in class_counts.most_common() if cls != "correct"]
+
+        # Header
+        header_parts = [f"{'classification':<20}"]
+        for nc in nav_causes:
+            header_parts.append(f"{nav_cause_labels[nc]:>8}")
+        header_parts.append(f"{'total':>7}")
+        p("  " + " ".join(header_parts))
+        p("  " + chr(9472) * (20 + 8 * len(nav_causes) + 8))
+
+        for cls in top_classes:
+            cls_wrong = [w for w in all_wrong if w["classification"] == cls]
+            parts = [f"{cls:<20}"]
+            for nc in nav_causes:
+                cnt = sum(1 for w in cls_wrong if w.get("_nav_root_cause") == nc)
+                parts.append(f"{cnt:>8}")
+            parts.append(f"{len(cls_wrong):>7}")
+            p("  " + " ".join(parts))
+
+        # Total row
+        parts = [f"{'TOTAL':<20}"]
+        for nc in nav_causes:
+            cnt = sum(1 for w in all_wrong if w.get("_nav_root_cause") == nc)
+            parts.append(f"{cnt:>8}")
+        parts.append(f"{len(all_wrong):>7}")
+        p("  " + " ".join(parts))
+        p("")
+
+        # Insight: what fraction of completely_wrong is actually budget vs extraction
+        if cw_answers:
+            cw_budget = sum(1 for w in cw_answers if w.get("_nav_root_cause") == "budget_exhausted")
+            cw_extract = sum(1 for w in cw_answers if w.get("_nav_root_cause") == "wrong_extraction")
+            cw_never = sum(1 for w in cw_answers if w.get("_nav_root_cause") == "never_visited")
+            p(f"  Insight: of {len(cw_answers)} completely_wrong answers:")
+            if cw_budget > 0:
+                p(f"    {cw_budget} ({cw_budget / len(cw_answers) * 100:.0f}%) from budget exhaustion — agent ran out of steps")
+            if cw_extract > 0:
+                p(f"    {cw_extract} ({cw_extract / len(cw_answers) * 100:.0f}%) from wrong extraction — agent reached site but read wrong data")
+            if cw_never > 0:
+                p(f"    {cw_never} ({cw_never / len(cw_answers) * 100:.0f}%) from never visiting — agent didn't navigate to required site")
+            p("")
+
     # ═══════════════════════════════════════════════════════════════════════
     # Section 6: ACTION PATTERN ANALYSIS
     # ═══════════════════════════════════════════════════════════════════════
@@ -1221,6 +1347,31 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
     p(f"    scroll:    avg={_safe_mean(scroll_counts):.1f}, median={_safe_median(scroll_counts):.0f}, max={max(scroll_counts) if scroll_counts else 0}")
     p(f"    view_more: avg={_safe_mean(vm_counts):.1f}, median={_safe_median(vm_counts):.0f}, max={max(vm_counts) if vm_counts else 0}")
     p("")
+
+    # Action type by outcome (scored vs zero)
+    scored_for_actions = [t for t in parsed if t.score > 0]
+    zero_for_actions = [t for t in parsed if t.is_zero]
+    if scored_for_actions and zero_for_actions:
+        # Collect all action types that appear
+        all_action_types = sorted(set(
+            a for t in parsed for a in t.action_counts.keys()
+        ))
+        p("  Action type by outcome (avg per task):")
+        p(f"    {'Action':<15} {'Scored>0':>10} {'Zero':>10} {'Delta':>10} {'Signal':>8}")
+        p("    " + chr(9472) * 55)
+        for atype in all_action_types:
+            s_avg = _safe_mean([t.action_counts.get(atype, 0) for t in scored_for_actions])
+            z_avg = _safe_mean([t.action_counts.get(atype, 0) for t in zero_for_actions])
+            delta = s_avg - z_avg
+            # Signal: significant if relative diff >15% OR absolute diff >=2.0
+            # (2+ extra actions per task is always meaningful with max_steps=30)
+            mean_val = (s_avg + z_avg) / 2
+            rel_diff = abs(delta) / mean_val if mean_val > 0 else 0
+            is_sig = rel_diff > 0.15 or abs(delta) >= 2.0
+            signal = "+" if delta > 0 and is_sig else (
+                     "-" if delta < 0 and is_sig else "~")
+            p(f"    {atype:<15} {s_avg:>10.2f} {z_avg:>10.2f} {delta:>+10.2f} {signal:>8}")
+        p("")
 
     # URL loop detection
     p("  URL loop detection:")
@@ -1255,33 +1406,54 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
 
     # (Scored-vs-zero efficiency comparison moved to Section 6b)
 
-    # Per-website action patterns
-    p("  Per-website action patterns:")
+    # Per-website action patterns (all action types)
+    # Collect all action types across the dataset
+    all_action_types_global = sorted(set(
+        a for t in parsed for a in t.action_counts.keys()
+    ))
+    # Only show action types with meaningful volume (>= 1% of total actions)
+    significant_actions = [a for a in all_action_types_global
+                           if total_actions.get(a, 0) >= grand_total * 0.01]
+
+    # Exclude task-level actions (stop = answer submission, wait = page loading)
+    # from site attribution — they don't meaningfully belong to any site
+    site_excluded_actions = {"stop", "wait"}
+    site_significant = [a for a in significant_actions if a not in site_excluded_actions]
+
+    p("  Per-website action profile (avg per task, site-attributed):")
+    # Table header
+    header = f"    {'website':<22} {'n':>4}"
+    for a in site_significant:
+        header += f" {a:>8}"
+    p(header)
+    p("    " + chr(9472) * (22 + 4 + 9 * len(site_significant)))
+
     for site, total, correct, acc, dnc, dnc_pct in site_stats[:8]:
         if site == "unknown":
             continue
         site_lower = site.lower()
-        site_goto = 0
-        site_click = 0
-        site_scroll = 0
-        site_vm = 0
-        site_task_count = 0
         seen_tasks = set()
+        site_action_totals = Counter()
+        site_task_count = 0
         for t, idx in website_groups[site]:
             if id(t) in seen_tasks:
                 continue
             seen_tasks.add(id(t))
             site_task_count += 1
-            for url in t.goto_urls:
-                if site_lower in _extract_domain(url):
-                    site_goto += 1
-            site_click += t.action_counts.get("click", 0)
-            site_scroll += t.action_counts.get("scroll", 0)
-            site_vm += t.view_more_count
+            # Use site_actions for site-attributed counts
+            # Match site_lower against all domains in site_actions
+            for domain, acounts in t.site_actions.items():
+                if site_lower in domain or domain in site_lower:
+                    for a in site_significant:
+                        site_action_totals[a] += acounts.get(a, 0)
 
         if site_task_count > 0:
-            p(f"    {site}  (n={site_task_count}):")
-            p(f"      goto={site_goto / site_task_count:.1f}/task  click={site_click / site_task_count:.1f}/task  scroll={site_scroll / site_task_count:.1f}/task  view_more={site_vm / site_task_count:.1f}/task")
+            row = f"    {site[:22]:<22} {site_task_count:>4}"
+            for a in site_significant:
+                avg_val = site_action_totals[a] / site_task_count
+                row += f" {avg_val:>8.1f}"
+            p(row)
+    p("    (all actions attributed to site via last-goto domain tracking)")
     p("")
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1364,13 +1536,33 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
             p(f"  {f'{lo}-{hi}':>10} {len(bucket):>6} {avg_s:>10.3f} {scored_pct:>7.0f}% {zero_pct:>6.0f}%")
         p("")
 
-        # Identify the tipping point
+        # Identify the tipping point (steepest scored-rate drop between adjacent buckets)
+        bucket_scored_rates = []
         for lo, hi in step_buckets:
             bucket = [t for t in parsed if lo <= t.total_steps <= hi]
-            if bucket and all(t.is_zero for t in bucket) and len(bucket) >= 3:
-                p(f"  Tipping point: tasks with >{lo-1} steps are universally zero-score")
-                p(f"    -> Agent should abort or switch strategy before step {lo}")
-                break
+            if bucket and len(bucket) >= 3:
+                scored_rate = sum(1 for t in bucket if t.score > 0) / len(bucket)
+                bucket_scored_rates.append((lo, hi, scored_rate, len(bucket)))
+        max_drop = 0
+        tip_idx = -1
+        for i in range(1, len(bucket_scored_rates)):
+            drop = bucket_scored_rates[i - 1][2] - bucket_scored_rates[i][2]
+            if drop > max_drop:
+                max_drop = drop
+                tip_idx = i
+        if tip_idx >= 0 and max_drop > 0.10:
+            prev = bucket_scored_rates[tip_idx - 1]
+            curr = bucket_scored_rates[tip_idx]
+            p(f"  Tipping point: scored rate drops {prev[2]:.0%} → {curr[2]:.0%} "
+              f"between {prev[0]}-{prev[1]} and {curr[0]}-{curr[1]} steps "
+              f"(Δ={max_drop:-.0%})")
+            p(f"    -> Agent should prioritize efficiency before step {curr[0]}")
+        elif bucket_scored_rates:
+            # Check if all buckets are uniformly poor
+            all_rates = [r for _, _, r, _ in bucket_scored_rates]
+            if max(all_rates) - min(all_rates) < 0.15:
+                p(f"  No clear tipping point: scored rate is uniformly "
+                  f"{_safe_mean(all_rates):.0%} across step ranges")
 
         # Cross-cut: goto=0 tasks (view_more-only or zero-interaction) mixed into buckets
         no_goto_tasks = [t for t in parsed if t.action_counts.get("goto", 0) == 0]
@@ -1442,31 +1634,52 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
                     l_cnt = lose_urls.get(url, 0)
                     p(f"        {url[:65]}  win={cnt} lose={l_cnt}")
 
-            # Action profile comparison
-            win_tasks = set(id(t) for t, _ in correct_entries)
-            lose_tasks = set(id(t) for t, _ in wrong_entries)
-            win_t_list = [t for t, _ in correct_entries if id(t) in win_tasks]
-            lose_t_list = [t for t, _ in wrong_entries if id(t) in lose_tasks]
+            # Action profile comparison (site-attributed)
+            # Collect site-specific action counts for winning vs losing tasks
+            def _site_action_avg(task_entries, site_key):
+                """Get avg site-attributed action counts for a set of (task, idx) entries."""
+                seen = set()
+                totals = Counter()
+                count = 0
+                for t, idx in task_entries:
+                    if id(t) not in seen:
+                        seen.add(id(t))
+                        count += 1
+                        for domain, acounts in t.site_actions.items():
+                            if site_key in domain or domain in site_key:
+                                for a, v in acounts.items():
+                                    totals[a] += v
+                if count == 0:
+                    return {}, 0
+                return {a: totals[a] / count for a in totals}, count
 
-            # Deduplicate tasks
-            seen_w, seen_l = set(), set()
-            uniq_win, uniq_lose = [], []
-            for t in win_t_list:
-                if id(t) not in seen_w:
-                    seen_w.add(id(t))
-                    uniq_win.append(t)
-            for t in lose_t_list:
-                if id(t) not in seen_l:
-                    seen_l.add(id(t))
-                    uniq_lose.append(t)
+            win_profile, n_win = _site_action_avg(correct_entries, site_lower)
+            lose_profile, n_lose = _site_action_avg(wrong_entries, site_lower)
 
-            if uniq_win and uniq_lose:
-                w_steps = _safe_mean([t.total_steps for t in uniq_win])
-                l_steps = _safe_mean([t.total_steps for t in uniq_lose])
-                w_vm = _safe_mean([t.view_more_count for t in uniq_win])
-                l_vm = _safe_mean([t.view_more_count for t in uniq_lose])
-                p(f"      Steps: win={w_steps:.0f} lose={l_steps:.0f} | "
-                  f"view_more: win={w_vm:.1f} lose={l_vm:.1f}")
+            if win_profile and lose_profile:
+                # Show the most differentiating actions for this site
+                all_acts = sorted(set(list(win_profile.keys()) + list(lose_profile.keys())))
+                # Filter to actions with meaningful signal (>= 0.3 avg in either group)
+                diffs = []
+                for a in all_acts:
+                    if a in site_excluded_actions:
+                        continue
+                    wv = win_profile.get(a, 0)
+                    lv = lose_profile.get(a, 0)
+                    if wv >= 0.3 or lv >= 0.3:
+                        diffs.append((a, wv, lv, wv - lv))
+                diffs.sort(key=lambda x: -abs(x[3]))
+                if diffs:
+                    parts = []
+                    for a, wv, lv, delta in diffs[:4]:
+                        # Use relative difference for signal: >15% of mean = significant
+                        mean_val = (wv + lv) / 2
+                        rel_diff = abs(delta) / mean_val if mean_val > 0 else 0
+                        is_sig = rel_diff > 0.15 or abs(delta) >= 2.0
+                        sig = "+" if delta > 0 and is_sig else (
+                              "-" if delta < 0 and is_sig else "~")
+                        parts.append(f"{a}: w={wv:.1f} l={lv:.1f}{sig}")
+                    p(f"      Actions (site-attributed, n={n_win}w/{n_lose}l): {' | '.join(parts)}")
             p("")
     else:
         p("  Insufficient data for winning/losing comparison.")
@@ -1509,17 +1722,48 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
             continue
         # stooq.com "step blackhole"
         if "stooq" in site.lower() and acc < 30:
+            # Compute actual per-task action stats for stooq
+            stooq_entries = website_groups.get(site, [])
+            stooq_seen = set()
+            stooq_goto_total, stooq_vm_total, stooq_task_n = 0, 0, 0
+            for t, idx in stooq_entries:
+                if id(t) not in stooq_seen:
+                    stooq_seen.add(id(t))
+                    stooq_task_n += 1
+                    for url in t.goto_urls:
+                        if "stooq" in _extract_domain(url):
+                            stooq_goto_total += 1
+                    stooq_vm_total += t.view_more_count
+            stooq_goto_avg = stooq_goto_total / max(stooq_task_n, 1)
+            stooq_vm_avg = stooq_vm_total / max(stooq_task_n, 1)
             p(f"  [OPT-3a] STOOQ STEP BLACKHOLE: {site} at {acc:.0f}% accuracy")
             p("    Agent loops on stooq.com/q/ without proper URL parameters")
-            p("    Evidence: avg 18.6 goto/task vs 0.4 view_more — agent uses goto excessively")
+            p(f"    Evidence: avg {stooq_goto_avg:.1f} goto/task vs {stooq_vm_avg:.1f} view_more — agent uses goto excessively")
             p("    Fix: system prompt builder should include URL construction hints per plugin")
             p("    Suggestion: add plugin_hints for stooq URL patterns (e.g. /q/?s=TICKER.US)")
             p("")
             opts.append(f"OPT-3a: {site} step blackhole")
         # taostats.io view_more trap
         if "taostats" in site.lower() and acc < 30:
+            # Compute actual winning vs losing view_more for taostats
+            tao_entries = website_groups.get(site, [])
+            tao_win_vm, tao_lose_vm = [], []
+            tao_seen_w, tao_seen_l = set(), set()
+            for t, idx in tao_entries:
+                is_correct = idx < len(t.subtask_scores) and t.subtask_scores[idx] > 0.5
+                if is_correct and id(t) not in tao_seen_w:
+                    tao_seen_w.add(id(t))
+                    tao_win_vm.append(t.view_more_count)
+                elif not is_correct and id(t) not in tao_seen_l:
+                    tao_seen_l.add(id(t))
+                    tao_lose_vm.append(t.view_more_count)
+            tao_win_avg = _safe_mean(tao_win_vm)
+            tao_lose_avg = _safe_mean(tao_lose_vm)
             p(f"  [OPT-3b] TAOSTATS VIEW_MORE NUANCE: {site} at {acc:.0f}% accuracy")
-            p("    CAUTION: winning taostats tasks use MORE view_more (10.0 vs 5.9)")
+            if tao_win_avg > tao_lose_avg:
+                p(f"    CAUTION: winning taostats tasks use MORE view_more ({tao_win_avg:.1f} vs {tao_lose_avg:.1f})")
+            else:
+                p(f"    view_more profile: win={tao_win_avg:.1f} vs lose={tao_lose_avg:.1f}")
             p("    The issue is NOT view_more itself — it's view_more WITHOUT goto navigation")
             p("    Evidence: zero-coverage tasks using only view_more score 0, but tasks")
             p("      combining goto + view_more have higher success rates")
@@ -1693,23 +1937,11 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
     p("  IMPROVEMENT PRIORITY RANKING (root-cause weighted):")
     p("")
 
-    # Compute root cause counts for ranking
-    _rc_budget = 0
-    _rc_extract = 0
-    _rc_never = 0
-    _rc_no_nav = 0
-    for t in parsed:
-        for wa in t.wrong_answers:
-            site_lower = wa["website"].lower()
-            visited = any(site_lower in d or d in site_lower for d in t.goto_domains)
-            if t.action_counts.get("goto", 0) == 0:
-                _rc_no_nav += 1
-            elif not visited:
-                _rc_never += 1
-            elif t.step_budget_exhausted:
-                _rc_budget += 1
-            else:
-                _rc_extract += 1
+    # Reuse pre-computed root cause counts (from TOP FINDINGS)
+    _rc_budget = rc_budget
+    _rc_extract = rc_wrong_extract
+    _rc_never = rc_never
+    _rc_no_nav = rc_no_nav
 
     priorities = []
     if _rc_budget > 0:
@@ -1975,6 +2207,20 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
 
     flagged = []
 
+    # Flag E: Tasks with 0 subtasks (task initialization failure)
+    for t in parsed:
+        if t.num_subtasks == 0:
+            flagged.append((t, "EMPTY_TASK",
+                            f"num_subtasks=0, steps={t.total_steps} — "
+                            f"task may have failed to initialize (no answer_details)"))
+
+    # Flag F: Tasks with parse_failed failure reason (agent output parsing error)
+    for t in parsed:
+        if t.failure_reason and "parse" in str(t.failure_reason).lower():
+            flagged.append((t, "PARSE_FAILED",
+                            f"failure_reason={t.failure_reason}, score={t.score:.2f}, "
+                            f"steps={t.total_steps} — agent output could not be parsed"))
+
     # Flag A: Score > 0 with 0 total steps (zero browser interaction)
     for t in parsed:
         if t.score > 0 and t.total_steps == 0:
@@ -2021,8 +2267,8 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
     if flagged:
         # Deduplicate: group flags by task_id, show most severe first
         from collections import OrderedDict
-        flag_severity = {"ZERO_INTERACTION": 0, "UNVISITED_CORRECT": 1,
-                         "ZERO_COVERAGE": 2, "VM_LOOP": 3}
+        flag_severity = {"EMPTY_TASK": 0, "PARSE_FAILED": 1, "ZERO_INTERACTION": 2,
+                         "UNVISITED_CORRECT": 3, "ZERO_COVERAGE": 4, "VM_LOOP": 5}
         task_flags = OrderedDict()
         for t, flag_type, reason in flagged:
             if t.task_id not in task_flags:
@@ -2036,8 +2282,15 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
         p(f"  Flagged: {unique_task_count} unique tasks with suspicious patterns")
         p("")
 
-        for t, flags in sorted_tasks:
-            # Sort flags by severity
+        # Separate bulk flags (summarize) from high-value flags (show detail)
+        bulk_flag_types = {"PARSE_FAILED", "EMPTY_TASK"}
+        detail_tasks = [(t, flags) for t, flags in sorted_tasks
+                        if any(ft not in bulk_flag_types for ft, _ in flags)]
+        bulk_tasks = [(t, flags) for t, flags in sorted_tasks
+                      if all(ft in bulk_flag_types for ft, _ in flags)]
+
+        # Show detailed flags individually
+        for t, flags in detail_tasks:
             flags.sort(key=lambda x: flag_severity.get(x[0], 99))
             primary = flags[0]
             p(f"  [{primary[0]}] Task {t.task_id} (score={t.score:.2f}):")
@@ -2054,28 +2307,78 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
                     p(f"      Q: {question[:70]}")
                     p(f"      Expected: {expected}")
                     p(f"      Actual:   {actual}")
-                    # Verdict: could this come from world knowledge?
                     if actual and expected and actual.strip().lower() == expected.strip().lower():
                         p(f"      -> EXACT MATCH without browsing — world knowledge or memorization")
                     elif actual and expected:
                         p(f"      -> Answer provided without site visit — source unclear")
             p("")
 
+        # Summarize bulk flags (PARSE_FAILED, EMPTY_TASK) as compact tables
+        if bulk_tasks:
+            # Group by flag type
+            bulk_by_type = defaultdict(list)
+            for t, flags in bulk_tasks:
+                for ft, _ in flags:
+                    bulk_by_type[ft].append(t)
+
+            for ft_name in ["PARSE_FAILED", "EMPTY_TASK"]:
+                ft_tasks = bulk_by_type.get(ft_name, [])
+                if not ft_tasks:
+                    continue
+                # Summarize by website
+                ft_sites = Counter()
+                for t in ft_tasks:
+                    for site in t.subtask_websites:
+                        ft_sites[site] += 1
+                if not ft_sites:
+                    ft_sites["unknown"] = len(ft_tasks)
+
+                p(f"  [{ft_name}] {len(ft_tasks)} tasks (all score=0):")
+                avg_steps = _safe_mean([t.total_steps for t in ft_tasks])
+                p(f"    Avg steps: {avg_steps:.0f} | By site: {', '.join(f'{s}({c})' for s, c in ft_sites.most_common(5))}")
+                # Show task IDs compactly
+                ids = sorted(t.task_id for t in ft_tasks)
+                id_str = ", ".join(str(i) for i in ids[:10])
+                if len(ids) > 10:
+                    id_str += f", ... (+{len(ids) - 10} more)"
+                p(f"    Task IDs: {id_str}")
+                p("")
+
         # Summary verdict
         env_tasks = set()
         agent_tasks = set()
         for t, flags in sorted_tasks:
             for ft, _ in flags:
-                if ft in ("ZERO_INTERACTION", "UNVISITED_CORRECT"):
+                if ft in ("ZERO_INTERACTION", "UNVISITED_CORRECT", "EMPTY_TASK", "PARSE_FAILED"):
                     env_tasks.add(t.task_id)
                 if ft in ("VM_LOOP", "ZERO_COVERAGE"):
                     agent_tasks.add(t.task_id)
 
         p("  FORENSIC VERDICT:")
         if env_tasks:
-            p(f"    Environment/evaluation concern: {len(env_tasks)} unique tasks score correctly"
-              f" without visiting required sites — suggests evaluation may accept LLM world"
-              f" knowledge or there is a caching/GT-binding issue")
+            # Break down environment concern by type
+            parse_cnt = sum(1 for tid in env_tasks
+                           for t, flags in sorted_tasks
+                           if t.task_id == tid
+                           for ft, _ in flags if ft == "PARSE_FAILED")
+            empty_cnt = sum(1 for tid in env_tasks
+                           for t, flags in sorted_tasks
+                           if t.task_id == tid
+                           for ft, _ in flags if ft == "EMPTY_TASK")
+            knowledge_cnt = sum(1 for tid in env_tasks
+                                for t, flags in sorted_tasks
+                                if t.task_id == tid
+                                for ft, _ in flags if ft in ("ZERO_INTERACTION", "UNVISITED_CORRECT"))
+            parts = []
+            if parse_cnt:
+                parts.append(f"{parse_cnt} parse failures (agent output not parseable)")
+            if empty_cnt:
+                parts.append(f"{empty_cnt} empty tasks (no subtasks generated)")
+            if knowledge_cnt:
+                parts.append(f"{knowledge_cnt} world-knowledge bypasses (scored without visiting sites)")
+            p(f"    Environment/evaluation concern: {len(env_tasks)} unique tasks")
+            for part in parts:
+                p(f"      - {part}")
         if agent_tasks:
             p(f"    Agent behavior concern: {len(agent_tasks)} unique tasks show pathological"
               f" patterns (infinite loops, zero coverage despite navigation)")

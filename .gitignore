@@ -1,2 +1,4 @@
 runs/
 scripts/__pycache__/
+.claude/
+trajectories.db
