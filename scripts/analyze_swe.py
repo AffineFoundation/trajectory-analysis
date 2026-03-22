@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-SWE-SYNTH (software engineering) trajectory analysis engine.
+SWE-INFINITE (software engineering) trajectory analysis engine.
 
+Supports both SWE-INFINITE and SWE-SYNTH schemas.
 Provides single-miner deep analysis with full report mode,
 plus exports used by batch_analyze.py.
 
@@ -113,7 +114,7 @@ _LABEL_ABBREV = {
     "target+regress": "t+reg", "regression_only": "reg_on", "identified_no_action": "id_na",
     "false_completion": "f_cmp",
     "target_fail_only": "tgt_fl", "partial": "partial",
-    "target_pass+minor_regress": "tp+mr", "partial_progress": "p_prog",
+    "target_pass+minor_regress": "tp+mr", "missing_tests_penalty": "mt_pen", "partial_progress": "p_prog",
 }
 
 _NEAR_WIN_THRESHOLD = 0.8
@@ -317,8 +318,9 @@ def _detect_loops(conversation, window=10, threshold=0.5):
 def _count_conversation_stats(conversation):
     """Count various conversation statistics.
 
-    IMPORTANT: Only counts actual commands inside ```bash blocks,
-    not keyword mentions in discussion text.
+    Supports two conversation formats:
+    1. Standard chat: entries with role=user/assistant/system and content
+    2. Codex format: entries with type=command_execution, command, aggregated_output
     """
     stats = {
         "total_turns": len(conversation), "assistant_turns": 0,
@@ -327,6 +329,46 @@ def _count_conversation_stats(conversation):
     }
 
     for msg in conversation:
+        msg_type = msg.get("type", "")
+
+        # Codex format: command_execution entries
+        if msg_type == "command_execution":
+            stats["assistant_turns"] += 1
+            cmd = str(msg.get("command", "")).lower()
+            # Strip bash -lc wrapper if present
+            if cmd.startswith("bash -lc "):
+                cmd = cmd[9:].strip("'\"")
+
+            # Classify command
+            if any(kw in cmd for kw in ["sed -i", "sed 's/", "cat >", "cat >>",
+                                         "tee ", "patch ", "vi ", "vim ", "nano "]):
+                stats["edit_commands"] += 1
+            elif re.search(r"(echo|printf)\s+.*>", cmd):
+                stats["edit_commands"] += 1
+            elif "python" in cmd and ("-c" in cmd or "<<" in cmd) and ">" in cmd:
+                stats["edit_commands"] += 1
+            elif any(kw in cmd for kw in ["pytest", "python -m pytest",
+                                           "npm test", "yarn test", "make test",
+                                           "cargo test", "go test", "mvn test",
+                                           "python -m unittest", "tox ", "nosetests"]):
+                stats["test_commands"] += 1
+            elif any(kw in cmd for kw in ["grep ", "rg ", "ag ", "ack "]):
+                stats["search_commands"] += 1
+            elif any(kw in cmd for kw in ["cat ", "head ", "tail ", "less ", "more ",
+                                           "find ", "ls ", "tree "]):
+                stats["read_commands"] += 1
+            continue
+
+        # Codex format: agent_message (reasoning/planning text)
+        if msg_type == "agent_message":
+            stats["assistant_turns"] += 1
+            continue
+
+        # Codex format: todo_list (planning)
+        if msg_type == "todo_list":
+            continue
+
+        # Standard chat format
         role = msg.get("role", "")
         content = str(msg.get("content", ""))
         if role == "assistant":
@@ -680,7 +722,7 @@ def _safe_stdev(values):
 # ── TrajectoryData ───────────────────────────────────────────────────────────
 
 class TrajectoryData:
-    """Parsed trajectory wrapper for SWE-SYNTH environment."""
+    """Parsed trajectory wrapper for SWE-SYNTH / SWE-INFINITE environments."""
 
     def __init__(self, raw):
         self.raw = raw
@@ -701,19 +743,61 @@ class TrajectoryData:
                 extra = {}
         self.extra = extra
 
-        self.all_passed = bool(extra.get("all_passed", False))
-        all_result = extra.get("all_result", "") or ""
-        self.all_passed_count, self.all_total = _parse_result(all_result)
-        self.all_result_str = all_result
+        # Detect infra error tasks (extra only has 'error' key, no real data)
+        self.is_infra_error = (
+            set(extra.keys()) <= {"error"} and "error" in extra
+        )
+        self.infra_error_msg = str(extra.get("error", ""))[:200] if self.is_infra_error else ""
 
-        self.target_passed = bool(extra.get("target_passed", False))
-        target_result = extra.get("target_result", "") or ""
-        self.target_passed_count, self.target_total = _parse_result(target_result)
-        self.target_result_str = target_result
+        # Detect schema: SWE-INFINITE has 'test_stats' dict; SWE-SYNTH has flat fields
+        test_stats = extra.get("test_stats", {}) or {}
+        if isinstance(test_stats, str):
+            try:
+                test_stats = json.loads(test_stats)
+            except Exception:
+                test_stats = {}
+        self._is_infinite = bool(test_stats) or extra.get("task_type") == "swe-infinite"
 
-        swe_instance_id = str(extra.get("swe_instance_id", ""))
-        self.swe_instance_id = swe_instance_id
-        self.project = _extract_project(swe_instance_id)
+        if self._is_infinite:
+            # SWE-INFINITE schema: test results in test_stats dict
+            self.all_passed = bool(test_stats.get("all_passed", False))
+            all_result = test_stats.get("all_result", "") or ""
+            self.all_passed_count, self.all_total = _parse_result(all_result)
+            self.all_result_str = all_result
+
+            # f2p_result = fail-to-pass (target tests)
+            f2p_result = test_stats.get("f2p_result", "") or ""
+            self.target_passed_count, self.target_total = _parse_result(f2p_result)
+            self.target_passed = self.target_total > 0 and self.target_passed_count == self.target_total
+            self.target_result_str = f2p_result
+
+            self.missing_tests = test_stats.get("missing_tests", []) or []
+            self.target_tests = test_stats.get("target_tests", []) or []
+        else:
+            # SWE-SYNTH schema: flat fields
+            self.all_passed = bool(extra.get("all_passed", False))
+            all_result = extra.get("all_result", "") or ""
+            self.all_passed_count, self.all_total = _parse_result(all_result)
+            self.all_result_str = all_result
+
+            self.target_passed = bool(extra.get("target_passed", False))
+            target_result = extra.get("target_result", "") or ""
+            self.target_passed_count, self.target_total = _parse_result(target_result)
+            self.target_result_str = target_result
+
+            self.target_tests = extra.get("target_tests", []) or []
+            self.missing_tests = extra.get("missing_tests", []) or []
+
+        # Project/repo: SWE-INFINITE has 'repo' directly; SWE-SYNTH needs extraction
+        if extra.get("repo"):
+            self.project = str(extra["repo"])
+        else:
+            swe_instance_id = str(extra.get("swe_instance_id", ""))
+            self.swe_instance_id = swe_instance_id
+            self.project = _extract_project(swe_instance_id)
+
+        # Instance ID (for dedup / cross-referencing)
+        self.instance_id = str(extra.get("instance_id", "") or extra.get("swe_instance_id", ""))
 
         fix_patch = extra.get("fix_patch", "") or ""
         self.fix_patch = fix_patch
@@ -722,7 +806,11 @@ class TrajectoryData:
         self.patch_lines = _count_patch_lines(fix_patch) if self.has_patch else 0
         self.patch_class = _classify_patch(fix_patch, self.patch_files, self.patch_lines)
 
-        self.language = _infer_language(self.project, self.patch_files)
+        # Language: SWE-INFINITE has 'repo_language' directly
+        if extra.get("repo_language"):
+            self.language = str(extra["repo_language"]).capitalize()
+        else:
+            self.language = _infer_language(self.project, self.patch_files)
 
         bug_types = extra.get("bug_types", []) or []
         if isinstance(bug_types, str):
@@ -738,10 +826,19 @@ class TrajectoryData:
         self.prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.completion_tokens = int(usage.get("completion_tokens", 0) or 0)
 
-        self.fixer_agent = str(extra.get("fixer_agent", ""))
+        # Agent/image info (for infra analysis)
+        self.agent_type = str(extra.get("agent_type", "") or extra.get("fixer_agent", ""))
         self.image = str(extra.get("image", ""))
-        self.target_tests = extra.get("target_tests", []) or []
-        self.missing_tests = extra.get("missing_tests", []) or []
+
+        # Infra: latency and timeout from request config
+        self.latency_ms = int(raw.get("latency_ms", 0) or 0)
+        request = extra.get("request", {}) or {}
+        self.max_iterations = int(request.get("max_iterations", 0) or 0)
+        self.timeout_sec = int(request.get("timeout", 0) or 0)
+        self.model_cost = float(extra.get("model_cost", 0) or 0)
+
+        # Backward compat
+        self.fixer_agent = self.agent_type
 
         # Patch-target alignment: does the patch modify the right module?
         self.patch_target_alignment = _compute_patch_target_alignment(
@@ -840,11 +937,14 @@ class TrajectoryData:
             self.failure_category = "target+regress"
         else:
             # target_ok=True AND non_target_rate >= 0.9: target bug fixed but still a loss
-            # Split: target all passed → target_pass+minor_regress (high SFT value)
-            #        target partially passed → partial_progress
             t_rate = t_pass / t_total if t_total > 0 else 0.0
             if target_ok:
-                self.failure_category = "target_pass+minor_regress"
+                # Distinguish: failures from missing tests (evaluator bug) vs real regressions
+                failures = a_total - a_pass
+                if self.missing_tests and len(self.missing_tests) >= failures:
+                    self.failure_category = "missing_tests_penalty"
+                else:
+                    self.failure_category = "target_pass+minor_regress"
             elif t_rate > 0:
                 self.failure_category = "partial_progress"
             else:
@@ -869,7 +969,7 @@ class TrajectoryData:
 
 # ── Data Fetching ────────────────────────────────────────────────────────────
 
-async def fetch_trajectories(uid, env_name="SWE-SYNTH", source="sampling"):
+async def fetch_trajectories(uid, env_name="SWE-INFINITE", source="sampling"):
     """Fetch trajectories for a miner UID.
 
     Returns: (miner_info, raw_trajectories)
@@ -1010,7 +1110,7 @@ async def _fetch_via_db(uid, env_name, source):
 # ── Report Generation ────────────────────────────────────────────────────────
 
 def generate_report(miner_info, raw_trajectories):
-    """Generate full SWE-SYNTH analysis report."""
+    """Generate full SWE analysis report (supports both SWE-SYNTH and SWE-INFINITE)."""
     lines = []
     p = lines.append
 
@@ -1050,10 +1150,13 @@ def generate_report(miner_info, raw_trajectories):
         for bt in t.bug_types:
             bug_type_groups[bt].append(t)
 
+    # Detect environment from data
+    env_label = raw_trajectories[0].get("env", "SWE") if raw_trajectories else "SWE"
+
     # ═══════════════════════════════════════════════════════════════════════
     # Header
     # ═══════════════════════════════════════════════════════════════════════
-    p("ENVIRONMENT: SWE-SYNTH")
+    p(f"ENVIRONMENT: {env_label}")
     p("=" * 80)
     p(f"  Samples: {n}")
     if matched > sl_size:
@@ -1079,6 +1182,18 @@ def generate_report(miner_info, raw_trajectories):
     p(f"  Total tasks:  {n}")
     p(f"  Win rate:     {win_count}/{n} ({win_rate:.1f}%)")
     p(f"  Avg score:    {avg_score:.3f}")
+
+    # Show miniswe-only metrics if parity-based assignment is detected
+    _agents_seen = set(t.agent_type for t in parsed if t.agent_type)
+    if "codex" in _agents_seen and "miniswe" in _agents_seen:
+        _ms_tasks = [t for t in parsed if t.agent_type == "miniswe"]
+        if _ms_tasks:
+            _ms_wins = sum(1 for t in _ms_tasks if t.is_win)
+            _ms_wr = _ms_wins / len(_ms_tasks) * 100
+            _infra = sum(1 for t in parsed if t.is_infra_error)
+            p(f"  Miniswe-only: {_ms_wins}/{len(_ms_tasks)} ({_ms_wr:.1f}%) "
+              f"[codex: {len([t for t in parsed if t.agent_type == 'codex'])}t 0% — different tasks]"
+              + (f" [{_infra} infra errors]" if _infra else ""))
     p("")
 
     p("  Top bottlenecks:")
@@ -1189,6 +1304,61 @@ def generate_report(miner_info, raw_trajectories):
             f"SCORING GAP: {len(tp_mr_list)} tasks fixed the target bug (target tests pass) but scored 0.0 "
             f"due to minor regressions — highest SFT correction value"
         )
+
+    # Finding: agent type disparity + parity-based assignment detection
+    agent_groups_tf = defaultdict(list)
+    for t in parsed:
+        agent_groups_tf[t.agent_type or "unknown"].append(t)
+    if len(agent_groups_tf) >= 2:
+        # Check parity-based assignment
+        parity_check_tf = defaultdict(lambda: {"even": 0, "odd": 0})
+        for t in parsed:
+            parity = "even" if t.task_id % 2 == 0 else "odd"
+            parity_check_tf[t.agent_type or "unknown"][parity] += 1
+        is_parity_assigned = all(
+            (counts["even"] == 0 or counts["odd"] == 0)
+            for counts in parity_check_tf.values()
+        ) and len(parity_check_tf) >= 2
+
+        agent_wrs = {}
+        for agent, tasks in agent_groups_tf.items():
+            if len(tasks) >= 5:
+                agent_wrs[agent] = sum(1 for t in tasks if t.is_win) / len(tasks) * 100
+        if agent_wrs:
+            best_agent = max(agent_wrs, key=agent_wrs.get)
+            worst_agent = min(agent_wrs, key=agent_wrs.get)
+            if agent_wrs[best_agent] > 0 and agent_wrs[worst_agent] == 0 and len(agent_groups_tf[worst_agent]) >= 10:
+                caveat = " (⚠ confounded: agents assigned by task_id parity, not comparable)" if is_parity_assigned else ""
+                top_findings.append(
+                    f"AGENT GAP: {worst_agent} 0% win ({len(agent_groups_tf[worst_agent])} tasks) "
+                    f"vs {best_agent} {agent_wrs[best_agent]:.0f}%{caveat}"
+                )
+
+    # Finding: language 0% across all agents
+    zero_langs = []
+    for lang, tasks in lang_groups.items():
+        if len(tasks) >= 5 and sum(1 for t in tasks if t.is_win) == 0:
+            # Check if it's 0% across all agent types (not just one)
+            agents_for_lang = set(t.agent_type for t in tasks)
+            if len(agents_for_lang) >= 2:
+                zero_langs.append((lang, len(tasks)))
+    if zero_langs:
+        lang_list = ", ".join(f"{l}({c})" for l, c in zero_langs)
+        top_findings.append(
+            f"LANGUAGE BLIND SPOT: {lang_list} at 0% win rate across ALL agent types — "
+            f"not caused by agent assignment"
+        )
+
+    # Finding: missing tests evaluator issue
+    mt_tasks = [t for t in parsed if t.missing_tests]
+    if mt_tasks and len(mt_tasks) >= 5:
+        mt_wr = sum(1 for t in mt_tasks if t.is_win) / len(mt_tasks) * 100
+        rest_wr = sum(1 for t in parsed if not t.missing_tests and t.is_win) / max(len(parsed) - len(mt_tasks), 1) * 100
+        if mt_wr == 0 and rest_wr > 0:
+            top_findings.append(
+                f"EVALUATOR ISSUE: {len(mt_tasks)} tasks with missing tests have 0% win rate "
+                f"(vs {rest_wr:.0f}% without) — test generation may be broken"
+            )
 
     if top_findings:
         p("  TOP FINDINGS:")
@@ -1333,6 +1503,25 @@ def generate_report(miner_info, raw_trajectories):
             for cat, cnt in pc.most_common():
                 p(f"    {cat:<22} {cnt:>3} ({cnt / len(patched_losses) * 100:>4.0f}%) {_category_description(cat)}")
             p("")
+
+            # Target-fail-only depth: how close are these to winning?
+            tfo_tasks = [t for t in patched_losses if t.failure_category == "target_fail_only"]
+            if len(tfo_tasks) >= 3:
+                tfo_zero = sum(1 for t in tfo_tasks if t.target_passed_count == 0)
+                tfo_partial = sum(1 for t in tfo_tasks if 0 < t.target_passed_count < t.target_total)
+                p("  TARGET_FAIL_ONLY DEPTH:")
+                p(f"    0% f2p (total miss):      {tfo_zero}/{len(tfo_tasks)} ({tfo_zero / len(tfo_tasks) * 100:.0f}%) — wrong fix direction")
+                p(f"    Partial f2p (some pass):   {tfo_partial}/{len(tfo_tasks)} ({tfo_partial / len(tfo_tasks) * 100:.0f}%) — partially correct")
+                tfo_patches = [t.patch_lines for t in tfo_tasks if t.patch_lines > 0]
+                if tfo_patches:
+                    p(f"    Patch size: median={_safe_median(tfo_patches):.0f}L, avg={_safe_mean(tfo_patches):.0f}L")
+                if tfo_zero / len(tfo_tasks) >= 0.6:
+                    p(f"    -> Majority are TOTAL MISSES — model submits confident but wrong patches")
+                    p(f"    -> SFT: these are NOT 'almost right'; need better bug COMPREHENSION, not just more iterations")
+                elif tfo_partial / len(tfo_tasks) >= 0.3:
+                    p(f"    -> Significant partial progress — model understands the bug but fix is incomplete")
+                    p(f"    -> SFT: synthesize trajectories that iterate on partial fixes")
+                p("")
 
             # Patch-target alignment analysis
             aligned_tasks = [t for t in patched_losses if t.patch_target_alignment != "no_data"]
@@ -1603,6 +1792,28 @@ def generate_report(miner_info, raw_trajectories):
         p("  No near-wins found.")
         p("")
 
+    # Missing-tests penalty detection: tasks where target passes but missing tests cause failure
+    mt_penalty_tasks = []
+    for t in losses:
+        if (t.target_passed and t.missing_tests
+            and t.all_total > 0
+            and len(t.missing_tests) >= (t.all_total - t.all_passed_count)):
+            mt_penalty_tasks.append(t)
+    if mt_penalty_tasks:
+        p("  ⚠ MISSING-TESTS PENALTY (target fixed but missing tests cause failure):")
+        for t in mt_penalty_tasks:
+            fail_count = t.all_total - t.all_passed_count
+            p(f"    task={t.task_id} ({t.project}): target {t.target_result_str} OK, "
+              f"all {t.all_result_str}, {len(t.missing_tests)} missing tests = {fail_count} failures")
+            if t.missing_tests:
+                for mt in t.missing_tests[:2]:
+                    p(f"      missing: {str(mt)[:80]}")
+                if len(t.missing_tests) > 2:
+                    p(f"      ... +{len(t.missing_tests) - 2} more")
+        p(f"    -> {len(mt_penalty_tasks)} tasks scored 0 SOLELY because evaluator-generated tests are missing")
+        p("    -> These are CORRECT FIXES penalized by test-generation failure — evaluator bug")
+        p("")
+
     anomalies = []
     for t in parsed:
         if t.is_win and t.target_total and t.target_total > 0:
@@ -1794,7 +2005,120 @@ def generate_report(miner_info, raw_trajectories):
         p("")
 
     # ═══════════════════════════════════════════════════════════════════════
-    # Section 9: PATCH ANALYSIS
+    # Section: WINNING PATTERN PROFILE
+    # ═══════════════════════════════════════════════════════════════════════
+    if wins:
+        section("WINNING PATTERN PROFILE")
+
+        # Win concentration by project
+        win_projs = Counter(t.project for t in wins)
+        p("  WINNING REPOS:")
+        p(f"  {'Project':<40} {'Wins':>5} {'Total':>6} {'Win%':>6} {'Patch':>6} {'f2p':>8} {'Agent':<10}")
+        p("  " + chr(9472) * 85)
+        for proj, wc in win_projs.most_common():
+            proj_tasks = project_groups[proj]
+            pwr = wc / len(proj_tasks) * 100
+            wp = [t for t in proj_tasks if t.is_win]
+            avg_patch = _safe_mean([t.patch_lines for t in wp if t.has_patch])
+            f2p_str = wp[0].target_result_str if wp else "-"
+            agent_str = wp[0].agent_type if wp else "-"
+            p(f"  {proj[:40]:<40} {wc:>5} {len(proj_tasks):>6} {pwr:>5.0f}% {avg_patch:>6.0f}L {f2p_str:>8} {agent_str:<10}")
+        p("")
+
+        # Win characteristics summary
+        win_patches = [t.patch_lines for t in wins if t.has_patch and t.patch_lines > 0]
+        win_turns = [t._conv_stats["assistant_turns"] for t in wins if t._conv_stats["assistant_turns"] > 0]
+        win_tokens = [t.total_tokens for t in wins if t.total_tokens > 0]
+        p("  WIN CHARACTERISTICS:")
+        if win_patches:
+            p(f"    Patch size: median={_safe_median(win_patches):.0f}L, avg={_safe_mean(win_patches):.0f}L, "
+              f"range={min(win_patches)}-{max(win_patches)}L")
+        if win_turns:
+            p(f"    Turns: median={_safe_median(win_turns):.0f}, avg={_safe_mean(win_turns):.0f}")
+        if win_tokens:
+            p(f"    Tokens: median={_safe_median(win_tokens):.0f}, avg={_safe_mean(win_tokens):.0f}")
+        ztw = sum(1 for t in wins if t._conv_stats["test_commands"] == 0)
+        p(f"    Test-free wins: {ztw}/{win_count} ({ztw / win_count * 100:.0f}%)")
+        p("")
+
+        # Memorization risk: small patches in tutorial/well-known repos
+        memo_candidates = []
+        for t in wins:
+            risk_factors = []
+            if t.patch_lines <= 10 and t.has_patch:
+                risk_factors.append(f"tiny patch ({t.patch_lines}L)")
+            if t._conv_stats["test_commands"] == 0:
+                risk_factors.append("no testing")
+            if t.explore_before_edit_ratio < 0.2 and t._conv_stats["assistant_turns"] > 0:
+                risk_factors.append(f"low exploration ({t.explore_before_edit_ratio:.0%})")
+            proj_lower = t.project.lower()
+            if any(kw in proj_lower for kw in ["learn", "tutorial", "example", "demo", "sample", "test"]):
+                risk_factors.append(f"tutorial-like repo name")
+            if len(risk_factors) >= 2:
+                memo_candidates.append((t, risk_factors))
+
+        if memo_candidates:
+            p("  ⚠ MEMORIZATION RISK CANDIDATES:")
+            for t, factors in memo_candidates:
+                p(f"    task={t.task_id} ({t.project}): {', '.join(factors)}")
+            p(f"    -> {len(memo_candidates)}/{win_count} wins ({len(memo_candidates) / win_count * 100:.0f}%) "
+              f"flagged — verify these are genuine problem-solving, not recall")
+            p("")
+
+        # Winning language/agent profile
+        win_langs = Counter(t.language for t in wins)
+        win_agents = Counter(t.agent_type for t in wins)
+        p(f"  Win by language: {', '.join(f'{l}({c})' for l, c in win_langs.most_common())}")
+        p(f"  Win by agent:    {', '.join(f'{a}({c})' for a, c in win_agents.most_common())}")
+        p("")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Section: DATA QUALITY
+    # ═══════════════════════════════════════════════════════════════════════
+    section("DATA QUALITY")
+
+    # Instance_id dedup check
+    instance_ids = [t.instance_id for t in parsed if t.instance_id]
+    unique_iids = set(instance_ids)
+    dupes = len(instance_ids) - len(unique_iids)
+    if dupes > 0:
+        p(f"  ⚠ DUPLICATE INSTANCE_IDS: {dupes} tasks share the same instance_id")
+        iid_counts = Counter(instance_ids)
+        for iid, cnt in iid_counts.most_common(5):
+            if cnt > 1:
+                dupe_tids = [t.task_id for t in parsed if t.instance_id == iid]
+                p(f"    {iid}: task_ids={dupe_tids}")
+        p("")
+    else:
+        p(f"  Instance_id dedup: OK ({len(unique_iids)} unique across {n} tasks)")
+
+    # Infra error count
+    infra_count = sum(1 for t in parsed if t.is_infra_error)
+    if infra_count > 0:
+        p(f"  Infra errors: {infra_count}/{n} ({infra_count / n * 100:.0f}%) — scored 0 due to infrastructure failure, not model")
+    else:
+        p(f"  Infra errors: 0/{n}")
+
+    # Bug types availability
+    has_bt = sum(1 for t in parsed if t.bug_types)
+    if has_bt == 0:
+        p(f"  Bug types: not available in this environment (all empty)")
+    else:
+        p(f"  Bug types: {has_bt}/{n} tasks have labels")
+
+    # Missing tests summary (critical for brief mode visibility)
+    _mt_count = sum(1 for t in parsed if t.missing_tests)
+    if _mt_count >= 5:
+        _mt_wr = sum(1 for t in parsed if t.missing_tests and t.is_win) / _mt_count * 100
+        _no_mt = [t for t in parsed if not t.missing_tests]
+        _no_mt_wr = sum(1 for t in _no_mt if t.is_win) / max(len(_no_mt), 1) * 100
+        p(f"  Missing tests: {_mt_count}/{n} tasks ({_mt_wr:.0f}% win vs {_no_mt_wr:.0f}% without)")
+        if _mt_wr == 0 and _no_mt_wr > 0:
+            p(f"  ⚠ Race condition: augmented tests generated async — early miners penalized (74% tasks affected cross-UID)")
+    p("")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Section: PATCH ANALYSIS
     # ═══════════════════════════════════════════════════════════════════════
     section("PATCH ANALYSIS")
     all_patched = [t for t in parsed if t.has_patch]
@@ -1853,7 +2177,32 @@ def generate_report(miner_info, raw_trajectories):
             projs = sorted(set(t.project for t in tasks))
             p(f"  [OPT-1] LANGUAGE GAP: {lang} at 0% win rate ({len(tasks)} tasks)")
             p(f"    Projects: {', '.join(projs)}")
-            p("    Suggestion: investigate language-specific tooling requirements")
+
+            # Scan conversations for dependency/env errors
+            dep_errors = []
+            _dep_kw = ["cannot load such file", "gem not found", "could not find",
+                        "loaderror", "modulenotfounderror", "command not found",
+                        "no such file or directory", "bundler could not find"]
+            for t in tasks:
+                for msg in t.conversation:
+                    content = str(msg.get("content", "") or msg.get("aggregated_output", "")).lower()
+                    for kw in _dep_kw:
+                        if kw in content:
+                            for line in content.split("\n"):
+                                if kw in line.lower():
+                                    dep_errors.append((t.task_id, t.project, line.strip()[:100]))
+                                    break
+                            break
+                    if dep_errors and dep_errors[-1][0] == t.task_id:
+                        break
+
+            if dep_errors:
+                p(f"    ENV DEPENDENCY ERRORS found in {len(dep_errors)}/{len(tasks)} tasks:")
+                for tid, proj, err in dep_errors[:5]:
+                    p(f"      task={tid} ({proj}): {err}")
+                p("    Suggestion: install missing dependencies in Docker image")
+            else:
+                p("    Suggestion: investigate language-specific tooling requirements")
             p("")
             opts.append(f"OPT-1: {lang} language gap")
 
@@ -1971,6 +2320,40 @@ def generate_report(miner_info, raw_trajectories):
             p("    Suggestion: include file path hints or narrow the problem scope in task generation")
             p("")
             opts.append("OPT-10: patch-target localization gap")
+
+    # Problem statement length vs win rate
+    ps_lens = [(t, len(t.problem_statement)) for t in parsed if t.problem_statement]
+    if len(ps_lens) >= 10:
+        ps_buckets = [
+            ("<100", lambda l: l < 100),
+            ("100-300", lambda l: 100 <= l < 300),
+            ("300-1K", lambda l: 300 <= l < 1000),
+            ("1K+", lambda l: l >= 1000),
+        ]
+        has_multiple = sum(1 for name, fn in ps_buckets if sum(1 for _, l in ps_lens if fn(l)) >= 2) >= 2
+        if has_multiple:
+            p("  PROBLEM STATEMENT LENGTH vs WIN RATE:")
+            p(f"  {'Length':<12} {'Count':>6} {'Win%':>6}")
+            p("  " + chr(9472) * 28)
+            short_loss_tasks = []
+            for name, fn in ps_buckets:
+                bucket = [(t, l) for t, l in ps_lens if fn(l)]
+                if len(bucket) < 2:
+                    continue
+                bw = sum(1 for t, _ in bucket if t.is_win)
+                bwr = bw / len(bucket) * 100
+                p(f"  {name:<12} {len(bucket):>6} {bwr:>5.0f}%")
+                if name == "<100" and bw == 0 and len(bucket) >= 3:
+                    short_loss_tasks = [(t, l) for t, l in bucket]
+
+            if short_loss_tasks:
+                p(f"  [OPT-11] SHORT PROBLEM STATEMENTS: {len(short_loss_tasks)} tasks with <100 chars, 0% win rate")
+                for t, l in sorted(short_loss_tasks, key=lambda x: x[1])[:3]:
+                    ps_preview = t.problem_statement[:60].replace('\n', ' ')
+                    p(f"    task={t.task_id} ({l} chars): \"{ps_preview}\"")
+                p("    Suggestion: enrich problem_statement with more context (expected behavior, affected file, reproduction)")
+                opts.append("OPT-11: short problem statements (< 100 chars)")
+            p("")
 
     if opts:
         p(f"  Summary: {len(opts)} recommendations")
@@ -2198,6 +2581,373 @@ def generate_report(miner_info, raw_trajectories):
             p("")
 
     # ═══════════════════════════════════════════════════════════════════════
+    # Section: WINNING vs LOSING TRAJECTORY PROFILE
+    # ═══════════════════════════════════════════════════════════════════════
+    if wins and losses:
+        section("WINNING vs LOSING TRAJECTORY PROFILE")
+        # Compute features for wins vs losses-with-patch
+        patched_losses = [t for t in losses if t.has_patch]
+        unpatched_losses = [t for t in losses if not t.has_patch]
+
+        w_pl = [t.patch_lines for t in wins if t.has_patch and t.patch_lines > 0]
+        l_pl = [t.patch_lines for t in patched_losses if t.patch_lines > 0]
+        w_tn = [t._conv_stats["assistant_turns"] for t in wins if t._conv_stats["assistant_turns"] > 0]
+        l_tn = [t._conv_stats["assistant_turns"] for t in patched_losses if t._conv_stats["assistant_turns"] > 0]
+        w_tk = [t.total_tokens for t in wins if t.total_tokens > 0]
+        l_tk = [t.total_tokens for t in patched_losses if t.total_tokens > 0]
+
+        p(f"  {'Metric':<25} {'Wins':>12} {'Loss+Patch':>12} {'No Patch':>12}")
+        p("  " + chr(9472) * 55)
+        p(f"  {'Count':<25} {win_count:>12} {len(patched_losses):>12} {len(unpatched_losses):>12}")
+        if w_pl and l_pl:
+            p(f"  {'Patch median (lines)':<25} {_safe_median(w_pl):>12.0f} {_safe_median(l_pl):>12.0f} {'n/a':>12}")
+            p(f"  {'Patch avg (lines)':<25} {_safe_mean(w_pl):>12.0f} {_safe_mean(l_pl):>12.0f} {'n/a':>12}")
+        if w_tn and l_tn:
+            un_tn = [t._conv_stats["assistant_turns"] for t in unpatched_losses if t._conv_stats["assistant_turns"] > 0]
+            p(f"  {'Turns median':<25} {_safe_median(w_tn):>12.0f} {_safe_median(l_tn):>12.0f} {_safe_median(un_tn):>12.0f}" if un_tn else "")
+        if w_tk and l_tk:
+            p(f"  {'Tokens median':<25} {_safe_median(w_tk):>12.0f} {_safe_median(l_tk):>12.0f} {'n/a':>12}")
+        w_ztw = sum(1 for t in wins if t._conv_stats["test_commands"] == 0)
+        l_ztw = sum(1 for t in patched_losses if t._conv_stats["test_commands"] == 0)
+        p(f"  {'Test-free %':<25} {w_ztw / max(win_count, 1) * 100:>11.0f}% {l_ztw / max(len(patched_losses), 1) * 100:>11.0f}% {'n/a':>12}")
+        p("")
+
+        # Interpretation
+        insights = []
+        if w_pl and l_pl and _safe_median(w_pl) < _safe_median(l_pl) * 0.6:
+            insights.append(f"Wins have {_safe_median(l_pl) / max(_safe_median(w_pl), 1):.1f}x SMALLER patches — concise targeted fixes beat exhaustive edits")
+        if w_tn and l_tn and _safe_median(w_tn) < _safe_median(l_tn) * 0.8:
+            insights.append(f"Wins are FASTER ({_safe_median(w_tn):.0f} vs {_safe_median(l_tn):.0f} turns) — quick recognition beats prolonged exploration")
+        if w_tk and l_tk and _safe_median(w_tk) < _safe_median(l_tk) * 0.7:
+            insights.append(f"Wins use FEWER tokens ({_safe_median(w_tk):.0f} vs {_safe_median(l_tk):.0f}) — efficiency correlates with success")
+        if insights:
+            p("  KEY INSIGHTS:")
+            for ins in insights:
+                p(f"    - {ins}")
+            p("")
+
+        p("  SFT/RL IMPLICATIONS:")
+        impl_n = [0]
+        def _impl(text):
+            impl_n[0] += 1
+            p(f"    {impl_n[0]}. {text}")
+
+        if w_pl and l_pl and _safe_median(w_pl) < _safe_median(l_pl):
+            _impl("Train for CONCISENESS: winning patches are smaller than losing patches")
+        elif w_pl and l_pl:
+            _impl("Patch SIZE is not the differentiator here — focus on patch CORRECTNESS instead")
+        if w_tn and l_tn and _safe_median(w_tn) < _safe_median(l_tn):
+            _impl("Train for SPEED: winners identify the fix early, losers keep exploring")
+        if w_tk and l_tk and _safe_median(w_tk) < _safe_median(l_tk):
+            _impl("Train for EFFICIENCY: winners use fewer tokens")
+        if len(unpatched_losses) > len(patched_losses):
+            _impl(f"{len(unpatched_losses)} losses never submitted a patch — prioritize AGENCY training (start editing sooner)")
+        if win_count > 0:
+            ztw_count = sum(1 for t in wins if t._conv_stats["test_commands"] == 0)
+            if ztw_count / win_count >= 0.8:
+                _impl(f"{ztw_count}/{win_count} wins are test-free — synthesize 'fix + verify' trajectories for SFT")
+        p("")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Section: INFRASTRUCTURE & AGENT ANALYSIS
+    # ═══════════════════════════════════════════════════════════════════════
+    section("INFRASTRUCTURE & AGENT ANALYSIS")
+
+    # Agent type analysis
+    agent_groups = defaultdict(list)
+    for t in parsed:
+        agent_groups[t.agent_type or "unknown"].append(t)
+    if len(agent_groups) >= 1 and not (len(agent_groups) == 1 and "" in agent_groups):
+        p("  AGENT TYPE:")
+        p(f"  {'Agent':<25} {'Count':>5} {'Win%':>6} {'Patch%':>7} {'Avg tokens':>12} {'Avg turns':>10}")
+        p("  " + chr(9472) * 72)
+        for agent in sorted(agent_groups.keys()):
+            tasks = agent_groups[agent]
+            awr = sum(1 for t in tasks if t.is_win) / len(tasks) * 100
+            patch_pct = sum(1 for t in tasks if t.has_patch) / len(tasks) * 100
+            atk = _safe_mean([t.total_tokens for t in tasks if t.total_tokens > 0])
+            atn = _safe_mean([t._conv_stats["assistant_turns"] for t in tasks if t._conv_stats["assistant_turns"] > 0])
+            p(f"  {(agent or 'unknown'):<25} {len(tasks):>5} {awr:>5.1f}% {patch_pct:>6.0f}% {atk:>12.0f} {atn:>10.1f}")
+
+        # Task assignment analysis: check if agent is determined by task_id parity
+        if len(agent_groups) >= 2:
+            parity_check = defaultdict(lambda: {"even": 0, "odd": 0})
+            for t in parsed:
+                parity = "even" if t.task_id % 2 == 0 else "odd"
+                parity_check[t.agent_type or "unknown"][parity] += 1
+
+            parity_determined = True
+            for agent, counts in parity_check.items():
+                if counts["even"] > 0 and counts["odd"] > 0:
+                    parity_determined = False
+                    break
+
+            if parity_determined and len(parity_check) >= 2:
+                p("")
+                p("  ⚠ AGENT ASSIGNMENT IS DETERMINISTIC BY TASK_ID PARITY:")
+                for agent in sorted(parity_check.keys()):
+                    counts = parity_check[agent]
+                    parity_label = "even" if counts["even"] > 0 else "odd"
+                    p(f"    {agent}: {parity_label} task_ids only ({counts[parity_label]} tasks)")
+                p("    -> codex and miniswe NEVER run on the same task_id")
+                p("    -> Agent win rate comparisons are confounded by task selection")
+                p("    -> Differences may reflect task difficulty, not agent capability")
+
+                # Even vs Odd task characteristic comparison
+                even_tasks = [t for t in parsed if t.task_id % 2 == 0]
+                odd_tasks = [t for t in parsed if t.task_id % 2 != 0]
+                if even_tasks and odd_tasks:
+                    even_repos = set(t.project for t in even_tasks)
+                    odd_repos = set(t.project for t in odd_tasks)
+                    shared_repos = even_repos & odd_repos
+                    even_mt = sum(1 for t in even_tasks if t.missing_tests)
+                    odd_mt = sum(1 for t in odd_tasks if t.missing_tests)
+                    even_patch = sum(1 for t in even_tasks if t.has_patch)
+                    odd_patch = sum(1 for t in odd_tasks if t.has_patch)
+                    even_infra = sum(1 for t in even_tasks if t.is_infra_error)
+                    odd_infra = sum(1 for t in odd_tasks if t.is_infra_error)
+
+                    p("")
+                    p("    EVEN vs ODD TASK COMPARISON:")
+                    p(f"    {'':>20} {'EVEN':>8} {'ODD':>8}")
+                    p(f"    {'Tasks':>20} {len(even_tasks):>8} {len(odd_tasks):>8}")
+                    p(f"    {'Unique repos':>20} {len(even_repos):>8} {len(odd_repos):>8}")
+                    p(f"    {'Shared repos':>20} {len(shared_repos):>8}{'':>8}")
+                    p(f"    {'Missing tests':>20} {even_mt:>8} {odd_mt:>8}")
+                    p(f"    {'Has patch':>20} {even_patch:>8} {odd_patch:>8}")
+                    p(f"    {'Infra errors':>20} {even_infra:>8} {odd_infra:>8}")
+
+                    # Problem statement length
+                    even_ps = [len(t.problem_statement) for t in even_tasks if t.problem_statement]
+                    odd_ps = [len(t.problem_statement) for t in odd_tasks if t.problem_statement]
+                    if even_ps and odd_ps:
+                        p(f"    {'PS median (chars)':>20} {_safe_median(even_ps):>8.0f} {_safe_median(odd_ps):>8.0f}")
+
+                    # Language distribution
+                    even_langs = Counter(t.language for t in even_tasks)
+                    odd_langs = Counter(t.language for t in odd_tasks)
+                    all_langs_parity = sorted(set(list(even_langs.keys()) + list(odd_langs.keys())))
+                    p(f"    {'Language':>20} {'EVEN':>8} {'ODD':>8}")
+                    for lang in all_langs_parity:
+                        p(f"    {lang:>20} {even_langs.get(lang, 0):>8} {odd_langs.get(lang, 0):>8}")
+
+                    # Summary insight
+                    if len(shared_repos) < min(len(even_repos), len(odd_repos)) * 0.3:
+                        p(f"    -> <30% repo overlap — tasks are substantially different, not just agent")
+                    if odd_mt > even_mt * 5 and odd_mt >= 5:
+                        p(f"    -> missing_tests heavily skewed to odd ({odd_mt} vs {even_mt}) — evaluator reliability differs by task parity")
+        p("")
+
+    # Docker image analysis
+    image_groups = defaultdict(list)
+    for t in parsed:
+        img = t.image.split("/")[-1] if t.image else "unknown"  # short name
+        image_groups[img].append(t)
+    if len(image_groups) > 1:
+        p("  DOCKER IMAGE:")
+        p(f"  {'Image':<35} {'Count':>5} {'Win%':>6}")
+        p("  " + chr(9472) * 50)
+        for img in sorted(image_groups.keys()):
+            tasks = image_groups[img]
+            iwr = sum(1 for t in tasks if t.is_win) / len(tasks) * 100
+            p(f"  {img:<35} {len(tasks):>5} {iwr:>5.1f}%")
+        p("")
+
+    # Latency & timeout analysis
+    latency_tasks = [t for t in parsed if t.latency_ms > 0]
+    if latency_tasks:
+        lat_sec = [t.latency_ms / 1000 for t in latency_tasks]
+        p("  LATENCY (seconds):")
+        w_lat = [t.latency_ms / 1000 for t in latency_tasks if t.is_win]
+        l_lat = [t.latency_ms / 1000 for t in latency_tasks if not t.is_win]
+        if w_lat:
+            p(f"    Wins:   avg={_safe_mean(w_lat):.0f}s, median={_safe_median(w_lat):.0f}s, max={max(w_lat):.0f}s")
+        if l_lat:
+            p(f"    Losses: avg={_safe_mean(l_lat):.0f}s, median={_safe_median(l_lat):.0f}s, max={max(l_lat):.0f}s")
+        p(f"    All:    avg={_safe_mean(lat_sec):.0f}s, median={_safe_median(lat_sec):.0f}s, max={max(lat_sec):.0f}s")
+
+        # Timeout detection: tasks that used >90% of timeout budget
+        timeout_tasks = [t for t in latency_tasks if t.timeout_sec > 0]
+        if timeout_tasks:
+            near_timeout = [t for t in timeout_tasks if t.latency_ms / 1000 >= t.timeout_sec * 0.9]
+            if near_timeout:
+                nt_loss = sum(1 for t in near_timeout if not t.is_win)
+                p(f"    NEAR-TIMEOUT (>=90% of budget): {len(near_timeout)} tasks ({nt_loss} losses)")
+                for t in sorted(near_timeout, key=lambda x: -x.latency_ms)[:5]:
+                    pct = t.latency_ms / 1000 / t.timeout_sec * 100
+                    r = "W" if t.is_win else "L"
+                    p(f"      task={t.task_id}: {t.latency_ms / 1000:.0f}s / {t.timeout_sec}s ({pct:.0f}%) [{r}] project={t.project}")
+                if nt_loss == len(near_timeout):
+                    p(f"    -> All near-timeout tasks are losses — timeout is a binding constraint")
+        p("")
+
+    # Max iterations analysis (use model_calls, not assistant_turns — codex has model_calls=1 always)
+    iter_tasks = [t for t in parsed if t.max_iterations > 0 and t.model_calls > 1]
+    if iter_tasks:
+        turns_by_iter = defaultdict(list)
+        for t in iter_tasks:
+            turns_by_iter[t.max_iterations].append(t)
+        if len(turns_by_iter) > 1:
+            p("  MAX ITERATIONS CONFIG:")
+            for mi in sorted(turns_by_iter.keys()):
+                tasks = turns_by_iter[mi]
+                iwr = sum(1 for t in tasks if t.is_win) / len(tasks) * 100
+                avg_mc = _safe_mean([t.model_calls for t in tasks])
+                p(f"    max_iter={mi}: {len(tasks)} tasks, {iwr:.0f}% win rate, avg {avg_mc:.0f} model calls")
+            p("")
+        elif iter_tasks:
+            mi = iter_tasks[0].max_iterations
+            hit_limit = [t for t in iter_tasks if t.model_calls >= mi * 0.8]
+            if hit_limit:
+                hl_loss = sum(1 for t in hit_limit if not t.is_win)
+                p(f"  MAX ITERATIONS ({mi}): {len(hit_limit)} tasks used >=80% of iterations ({hl_loss} losses)")
+                p("")
+
+    # Codex command budget analysis (codex has model_calls=1 but many sub-commands)
+    codex_tasks = [t for t in parsed if t.agent_type == "codex" and t._conv_stats["assistant_turns"] > 0]
+    if codex_tasks:
+        cmd_counts = [t._conv_stats["assistant_turns"] for t in codex_tasks]
+        p(f"  CODEX COMMAND BUDGET:")
+        p(f"    Avg commands per task: {_safe_mean(cmd_counts):.0f}, max: {max(cmd_counts)}")
+        heavy = [t for t in codex_tasks if t._conv_stats["assistant_turns"] >= 100]
+        if heavy:
+            heavy_loss = sum(1 for t in heavy if not t.is_win)
+            p(f"    Tasks with >=100 commands: {len(heavy)} ({heavy_loss} losses)")
+        p("")
+
+    # Infrastructure error detection (tasks that crashed before execution)
+    infra_errors = [t for t in parsed if t.is_infra_error]
+    if infra_errors:
+        p("  INFRASTRUCTURE ERRORS (tasks that crashed before execution):")
+        p(f"    Count: {len(infra_errors)}/{n} ({len(infra_errors) / n * 100:.0f}%)")
+        # Group by error pattern
+        error_patterns = Counter()
+        for t in infra_errors:
+            msg = t.infra_error_msg.lower()
+            if "litellm" in msg or "openai" in msg or "http 500" in msg:
+                error_patterns["LLM API error (HTTP 500)"] += 1
+            elif "timeout" in msg:
+                error_patterns["timeout"] += 1
+            elif "docker" in msg or "container" in msg:
+                error_patterns["container error"] += 1
+            else:
+                error_patterns["other"] += 1
+        for pattern, cnt in error_patterns.most_common():
+            p(f"      {pattern}: {cnt}")
+        p("    -> These tasks scored 0 due to infra failure, NOT model performance")
+        p("")
+
+    # Language × Agent type cross-analysis
+    if len(agent_groups) >= 2 and len(lang_groups) >= 2:
+        p("  LANGUAGE x AGENT TYPE CROSS-ANALYSIS:")
+        agents_list = sorted(agent_groups.keys())
+        aw = 12
+        p(f"  {'Language':<{aw}}" + "".join(f" {(a or 'unk'):<20}" for a in agents_list) + "  Observation")
+        p("  " + chr(9472) * (aw + 22 * len(agents_list) + 15))
+        for lang in sorted(lang_groups.keys()):
+            row = f"  {lang:<{aw}}"
+            vals = []
+            for agent in agents_list:
+                tasks = [t for t in parsed if t.language == lang and t.agent_type == agent]
+                if tasks:
+                    wr = sum(1 for t in tasks if t.is_win) / len(tasks) * 100
+                    row += f" {len(tasks):>3}t {wr:>4.0f}% win      "
+                    vals.append((agent, len(tasks), wr))
+                else:
+                    row += f"   -                 "
+                    vals.append((agent, 0, 0))
+            # Observation: check if one agent dominates or both fail
+            active = [(a, n, wr) for a, n, wr in vals if n > 0]
+            if len(active) >= 2:
+                all_zero = all(wr == 0 for _, _, wr in active)
+                if all_zero:
+                    row += "  both 0%"
+                else:
+                    best = max(active, key=lambda x: x[2])
+                    worst = min(active, key=lambda x: x[2])
+                    if best[2] > 0 and worst[2] == 0:
+                        row += f"  only {best[0]} wins"
+            elif len(active) == 1:
+                row += f"  {active[0][0]} only"
+            p(row)
+        p("")
+
+        # Summarize key insight
+        agent_only_langs = []
+        both_zero_langs = []
+        for lang in sorted(lang_groups.keys()):
+            by_agent = {}
+            for agent in agents_list:
+                tasks = [t for t in parsed if t.language == lang and t.agent_type == agent]
+                if tasks:
+                    by_agent[agent] = sum(1 for t in tasks if t.is_win) / len(tasks) * 100
+            if len(by_agent) >= 2:
+                if all(v == 0 for v in by_agent.values()):
+                    both_zero_langs.append(lang)
+                elif any(v > 0 for v in by_agent.values()) and any(v == 0 for v in by_agent.values()):
+                    winning_agent = [a for a, v in by_agent.items() if v > 0]
+                    agent_only_langs.append((lang, winning_agent))
+        if both_zero_langs:
+            p(f"    Languages with 0% across ALL agents: {', '.join(both_zero_langs)}")
+            p(f"    -> Not caused by agent assignment; genuine capability or environment gap")
+        if agent_only_langs:
+            for lang, winners in agent_only_langs:
+                p(f"    {lang}: only {', '.join(winners)} agent wins — investigate if {lang} tasks are harder for other agents")
+        p("")
+
+    # Missing tests analysis
+    missing_test_tasks = [t for t in parsed if t.missing_tests]
+    if missing_test_tasks:
+        p("  MISSING TESTS ANALYSIS:")
+        mt_losses = [t for t in missing_test_tasks if not t.is_win]
+        mt_wins = [t for t in missing_test_tasks if t.is_win]
+        p(f"    Tasks with missing tests: {len(missing_test_tasks)} ({len(mt_wins)} wins, {len(mt_losses)} losses)")
+        avg_missing = _safe_mean([len(t.missing_tests) for t in missing_test_tasks])
+        p(f"    Avg missing tests per task: {avg_missing:.1f}")
+        # Missing tests = tests that should exist but don't → evaluator might be unreliable
+        if len(missing_test_tasks) >= 3:
+            mt_wr = len(mt_wins) / len(missing_test_tasks) * 100
+            rest = [t for t in parsed if not t.missing_tests]
+            rest_wr = sum(1 for t in rest if t.is_win) / max(len(rest), 1) * 100
+            p(f"    Win rate with missing tests: {mt_wr:.0f}% vs {rest_wr:.0f}% without")
+            if abs(mt_wr - rest_wr) > 15:
+                direction = "lower" if mt_wr < rest_wr else "higher"
+                p(f"    -> Missing tests correlate with {direction} win rate — potential evaluator bias")
+
+        # Missing tests by agent type
+        if len(agent_groups) >= 2:
+            mt_agents = Counter(t.agent_type for t in missing_test_tasks)
+            all_agents = Counter(t.agent_type for t in parsed)
+            p(f"    By agent: " + ", ".join(
+                f"{a}: {mt_agents.get(a, 0)}/{all_agents[a]} ({mt_agents.get(a, 0) / all_agents[a] * 100:.0f}%)"
+                for a in sorted(all_agents.keys())
+            ))
+            # Check if missing tests are concentrated in one agent
+            for a in sorted(all_agents.keys()):
+                if all_agents[a] >= 5:
+                    mt_pct = mt_agents.get(a, 0) / all_agents[a] * 100
+                    if mt_pct > 50:
+                        p(f"    -> {a} has {mt_pct:.0f}% missing-test rate — test generation may be broken for this agent")
+
+        # Sample missing test names
+        if missing_test_tasks:
+            p("    Sample missing tests:")
+            for t in missing_test_tasks[:3]:
+                mt_preview = t.missing_tests[:2]
+                mt_str = "; ".join(str(m)[:60] for m in mt_preview)
+                if len(t.missing_tests) > 2:
+                    mt_str += f" +{len(t.missing_tests) - 2} more"
+                p(f"      task={t.task_id} ({t.project}): {mt_str}")
+
+        # Race condition warning
+        if len(missing_test_tasks) >= 5 and mt_wr == 0 and rest_wr > 0:
+            p(f"    ⚠ KNOWN RACE CONDITION: augmented tests are generated asynchronously.")
+            p(f"      Miners executing early (before test generation completes) get missing_tests → score 0.")
+            p(f"      Cross-UID analysis shows 74% of tasks have divergent missing_tests across miners.")
+            p(f"      Use --compare to verify if this miner runs early/late relative to others.")
+        p("")
+
+    # ═══════════════════════════════════════════════════════════════════════
     # ALL TASKS TABLE
     # ═══════════════════════════════════════════════════════════════════════
     p("=" * 80)
@@ -2239,6 +2989,7 @@ def _category_description(cat):
     return {"target_fail_only": "target test fails, others pass", "regression_only": "target passes but regressions elsewhere",
             "target+regress": "both target and other tests fail", "partial": "some progress but incomplete",
             "target_pass+minor_regress": "target bug fixed but minor non-target regressions (high SFT value)",
+            "missing_tests_penalty": "CORRECT FIX — failures are all from missing evaluator tests (evaluator bug)",
             "partial_progress": "some test progress but incomplete fix"}.get(cat, "")
 
 
@@ -2268,7 +3019,20 @@ def generate_comparison_report(uid_data):
                 pass
         uid_parsed[uid] = parsed
 
-    p("SWE-SYNTH COMPARISON REPORT")
+    # Detect environment from data
+    _env_label = "SWE"
+    for uid in uids:
+        for t_raw in (uid_data[uid][1] or []):
+            if isinstance(t_raw, dict) and t_raw.get("env"):
+                _env_label = t_raw["env"]
+                break
+            elif isinstance(t_raw, TrajectoryData) and t_raw.raw.get("env"):
+                _env_label = t_raw.raw["env"]
+                break
+        if _env_label != "SWE":
+            break
+
+    p(f"{_env_label} COMPARISON REPORT")
     p("=" * 80)
     p(f"  UIDs compared: {', '.join(str(u) for u in uids)}")
     p("")
@@ -2346,6 +3110,30 @@ def generate_comparison_report(uid_data):
                 traits.append(f"primary failure: {prof['dom_fail']}")
             if traits:
                 p(f"    UID {uid}: {'; '.join(traits)}")
+        p("")
+
+    # Missing-tests impact comparison
+    has_mt_data = False
+    for uid in uids:
+        if any(t.missing_tests for t in uid_parsed[uid]):
+            has_mt_data = True
+            break
+    if has_mt_data:
+        p("  EVALUATOR RACE CONDITION IMPACT:")
+        p(f"  {'UID':>6} {'Measured':>9} {'w/o MT':>9} {'MT tasks':>9} {'Bias':>9}")
+        p("  " + chr(9472) * 42)
+        for uid in uids:
+            ps = uid_parsed[uid]
+            if not ps:
+                continue
+            mt_tasks = [t for t in ps if t.missing_tests]
+            no_mt = [t for t in ps if not t.missing_tests]
+            measured = sum(1 for t in ps if t.is_win) / len(ps) * 100
+            corrected = sum(1 for t in no_mt if t.is_win) / max(len(no_mt), 1) * 100 if no_mt else 0
+            bias = corrected - measured
+            p(f"  {uid:>6} {measured:>8.1f}% {corrected:>8.1f}% {len(mt_tasks):>9} {bias:>+8.1f}pp")
+        p("  -> Measured win rates are deflated by async test generation race condition")
+        p("  -> 'w/o MT' = win rate excluding tasks with missing tests (fairer estimate)")
         p("")
 
     # Per-project
@@ -2573,6 +3361,73 @@ def generate_comparison_report(uid_data):
     p("")
     # Failure mode migration analysis
     p(_generate_failure_migration_section(uid_data, uid_parsed))
+    p("")
+
+    # Cross-UID Win Consistency
+    p("  CROSS-UID WIN CONSISTENCY:")
+    p("  " + chr(9472) * 50)
+    uid_win_tids = {}
+    for uid in uids:
+        uid_win_tids[uid] = set(t.task_id for t in uid_parsed[uid] if t.is_win)
+    all_win_tids = set()
+    for tids in uid_win_tids.values():
+        all_win_tids |= tids
+
+    if not all_win_tids:
+        p("    No wins found across any UID.")
+    else:
+        tid_freq = Counter()
+        for uid, tids in uid_win_tids.items():
+            for tid in tids:
+                tid_freq[tid] += 1
+
+        p(f"    Total unique winning task_ids: {len(all_win_tids)}")
+        p(f"    UIDs compared: {len(uids)}")
+
+        # Build task detail lookup
+        tid_detail = {}
+        for uid in uids:
+            for t in uid_parsed[uid]:
+                if t.is_win and t.task_id not in tid_detail:
+                    tid_detail[t.task_id] = {
+                        "project": t.project, "lang": t.language,
+                        "patch_lines": t.patch_lines, "f2p": t.target_result_str,
+                    }
+
+        for freq in sorted(set(tid_freq.values()), reverse=True):
+            tids = sorted(t for t, c in tid_freq.items() if c == freq)
+            label = "ALL" if freq == len(uids) else f"{freq}/{len(uids)}"
+            risk = " ⚠ EASY/MEMORIZATION" if freq == len(uids) else ""
+            p(f"    Won by {label} UIDs:{risk}")
+            for tid in tids:
+                d = tid_detail.get(tid, {})
+                p(f"      tid={tid}: {d.get('project','?'):<35} {d.get('lang','?'):<12} "
+                  f"patch={d.get('patch_lines',0):>4}L  f2p={d.get('f2p','?')}")
+
+        # Unique wins per UID
+        p("")
+        p("    UNIQUE WINS (tasks won by only 1 UID — genuine capability signal):")
+        unique_count = 0
+        for uid in uids:
+            unique = [tid for tid in uid_win_tids[uid] if tid_freq[tid] == 1]
+            if unique:
+                unique_count += len(unique)
+                for tid in sorted(unique):
+                    d = tid_detail.get(tid, {})
+                    p(f"      UID {uid}: tid={tid} ({d.get('project','?')}, {d.get('patch_lines',0)}L)")
+        if unique_count == 0:
+            p("      (none — all wins are shared, no unique capability observed)")
+        p("")
+
+        # Summary
+        always_win = sum(1 for c in tid_freq.values() if c == len(uids))
+        p(f"    Summary: {always_win} always-win tasks (easy/memorizable), "
+          f"{unique_count} unique-win tasks (genuine capability)")
+        if always_win >= 2 and len(all_win_tids) >= 3:
+            easy_pct = always_win / len(all_win_tids) * 100
+            p(f"    -> {easy_pct:.0f}% of winning tasks are easy/memorizable — "
+              f"real differentiating capability is in the {len(all_win_tids) - always_win} "
+              f"non-universal wins")
 
     return "\n".join(lines)
 
@@ -2963,16 +3818,24 @@ def _mode_weakness_description(mode):
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 async def async_main():
-    parser = argparse.ArgumentParser(description="SWE-SYNTH trajectory analysis")
+    parser = argparse.ArgumentParser(description="SWE-INFINITE trajectory analysis")
     parser.add_argument("--uid", type=int, default=None, help="Miner UID (0-255), required unless --compare")
-    parser.add_argument("--env", type=str, default="SWE-SYNTH", help="Environment name (default: SWE-SYNTH)")
+    parser.add_argument("--env", type=str, default="SWE-INFINITE", help="Environment name (default: SWE-INFINITE)")
     parser.add_argument("--output", "-o", type=str, default=None, help="Write report to file")
     parser.add_argument("--all", action="store_true", help="Fetch all historical data (not just sampling list)")
     parser.add_argument("--recent", type=int, default=None, help="Only analyze N most recent trajectories")
     parser.add_argument("--limit", type=int, default=None, help="Limit to first N trajectories")
     parser.add_argument("--inspect", action="store_true", help="Dump raw extra field structure")
+    parser.add_argument("--brief", action="store_true",
+                        help="Brief output: executive summary + top findings + SFT implications only")
     parser.add_argument("--compare", type=str, default=None, help="Compare multiple UIDs (comma-separated)")
     parser.add_argument("--json", action="store_true", help="Also dump raw JSON")
+    parser.add_argument("--miniswe-only", action="store_true",
+                        help="Filter to miniswe (odd task_id) tasks only, excluding codex")
+    parser.add_argument("--export-wins", action="store_true",
+                        help="Export winning trajectories as JSON (for SFT pipelines)")
+    parser.add_argument("--export-sft", action="store_true",
+                        help="Export tiered SFT dataset: positive/P0_evaluator_bug/P2_partial/near_win/exclude")
     args = parser.parse_args()
 
     env_name = args.env
@@ -2995,7 +3858,12 @@ async def async_main():
         results = await asyncio.gather(*[_fetch_one(uid) for uid in uids])
         uid_data = {}
         for uid, miner_info, trajs in results:
+            if args.miniswe_only:
+                trajs = [t for t in trajs if int(t.get("task_id", 0)) % 2 != 0]
             uid_data[uid] = (miner_info, trajs)
+
+        if args.miniswe_only:
+            print(f"  --miniswe-only: filtered to odd task_ids only", file=sys.stderr)
 
         report = generate_comparison_report(uid_data)
         if args.output:
@@ -3056,8 +3924,150 @@ async def async_main():
         print(json.dumps(raw_trajectories[:3], indent=2, default=str, ensure_ascii=False))
         return
 
+    if args.miniswe_only:
+        before = len(raw_trajectories)
+        raw_trajectories = [t for t in raw_trajectories
+                            if int(t.get("task_id", 0)) % 2 != 0]
+        print(f"  --miniswe-only: filtered {before} -> {len(raw_trajectories)} (odd task_ids only)", file=sys.stderr)
+
+    if args.export_wins:
+        wins = []
+        for t in raw_trajectories:
+            if float(t.get("score", 0)) >= 0.5:
+                extra = t.get("extra", {}) or {}
+                if isinstance(extra, str):
+                    try: extra = json.loads(extra)
+                    except Exception: extra = {}
+                wins.append({
+                    "task_id": t.get("task_id"),
+                    "score": t.get("score"),
+                    "repo": extra.get("repo", extra.get("swe_instance_id", "")),
+                    "language": extra.get("repo_language", ""),
+                    "instance_id": extra.get("instance_id", ""),
+                    "problem_statement": extra.get("problem_statement", ""),
+                    "fix_patch": extra.get("fix_patch", ""),
+                    "conversation": extra.get("conversation", []),
+                    "agent_type": extra.get("agent_type", ""),
+                    "model_calls": extra.get("model_calls", 0),
+                })
+        output = json.dumps(wins, indent=2, default=str, ensure_ascii=False)
+        if args.output:
+            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+            with open(args.output, "w") as f:
+                f.write(output)
+            print(f"Exported {len(wins)} wins to {args.output}", file=sys.stderr)
+        else:
+            print(output)
+        print(f"\n  {len(wins)} winning trajectories exported", file=sys.stderr)
+        return
+
+    if args.export_sft:
+        def _traj_to_record(t, tier, reason):
+            extra = t.get("extra", {}) or {}
+            if isinstance(extra, str):
+                try: extra = json.loads(extra)
+                except Exception: extra = {}
+            test_stats = extra.get("test_stats", {}) or {}
+            if isinstance(test_stats, str):
+                try: test_stats = json.loads(test_stats)
+                except Exception: test_stats = {}
+            return {
+                "sft_tier": tier,
+                "sft_reason": reason,
+                "task_id": t.get("task_id"),
+                "score": t.get("score"),
+                "repo": extra.get("repo", extra.get("swe_instance_id", "")),
+                "language": extra.get("repo_language", ""),
+                "instance_id": extra.get("instance_id", ""),
+                "problem_statement": extra.get("problem_statement", ""),
+                "fix_patch": extra.get("fix_patch", ""),
+                "conversation": extra.get("conversation", []),
+                "agent_type": extra.get("agent_type", ""),
+                "model_calls": extra.get("model_calls", 0),
+                "f2p_result": test_stats.get("f2p_result", ""),
+                "all_result": test_stats.get("all_result", ""),
+            }
+
+        records = []
+        always_win_tids = {331, 341}  # confirmed memorization
+
+        for t in raw_trajectories:
+            extra = t.get("extra", {}) or {}
+            if isinstance(extra, str):
+                try: extra = json.loads(extra)
+                except Exception: extra = {}
+            score = float(t.get("score", 0))
+            tid = int(t.get("task_id", 0))
+            test_stats = extra.get("test_stats", {}) or {}
+            if isinstance(test_stats, str):
+                try: test_stats = json.loads(test_stats)
+                except Exception: test_stats = {}
+
+            if score >= 0.5:
+                if tid in always_win_tids:
+                    records.append(_traj_to_record(t, "exclude", "always-win memorization"))
+                else:
+                    records.append(_traj_to_record(t, "positive", "genuine win"))
+            elif extra.get("fix_patch", "").strip():
+                f2p = test_stats.get("f2p_result", "")
+                all_r = test_stats.get("all_result", "")
+                mt = test_stats.get("missing_tests", []) or []
+                try:
+                    f2p_p, f2p_t = [int(x) for x in f2p.split("/")]
+                    all_p, all_t = [int(x) for x in all_r.split("/")]
+                except (ValueError, AttributeError):
+                    continue
+
+                # P0: target passes but missing_tests cause failure
+                if f2p_p == f2p_t and f2p_t > 0 and mt and len(mt) >= (all_t - all_p):
+                    records.append(_traj_to_record(t, "P0_evaluator_bug", "correct fix penalized by missing tests"))
+                # P1: target passes but regressions
+                elif f2p_p == f2p_t and f2p_t > 0 and all_p < all_t:
+                    records.append(_traj_to_record(t, "P1_regression", "target fixed but regressions"))
+                # P2: partial f2p
+                elif 0 < f2p_p < f2p_t:
+                    records.append(_traj_to_record(t, "P2_partial", f"partial fix ({f2p})"))
+                # Near-win (high all_pass but target fails)
+                elif all_t > 0 and all_p / all_t >= 0.8:
+                    records.append(_traj_to_record(t, "near_win", f"all {all_r} but target {f2p}"))
+
+        output = json.dumps(records, indent=2, default=str, ensure_ascii=False)
+        if args.output:
+            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+            with open(args.output, "w") as f:
+                f.write(output)
+            print(f"Exported {len(records)} SFT records to {args.output}", file=sys.stderr)
+        else:
+            print(output)
+
+        tier_counts = Counter(r["sft_tier"] for r in records)
+        print(f"\n  SFT export: {len(records)} records", file=sys.stderr)
+        for tier, cnt in sorted(tier_counts.items()):
+            print(f"    {tier}: {cnt}", file=sys.stderr)
+        return
+
     miner_info["uid"] = uid
     report = generate_report(miner_info, raw_trajectories)
+
+    if args.brief:
+        # Extract key sections by splitting on section headers
+        keep = {"EXECUTIVE SUMMARY", "WINNING PATTERN PROFILE",
+                "WINNING vs LOSING TRAJECTORY PROFILE", "DATA QUALITY"}
+        sections = re.split(r"(={80}\n\d+\. .+\n={80})", report)
+        # sections[0] = header, then alternating [separator, content, separator, content, ...]
+        brief_parts = [sections[0].rstrip()]  # always keep header
+        i = 1
+        while i < len(sections) - 1:
+            header_block = sections[i]
+            content = sections[i + 1] if i + 1 < len(sections) else ""
+            # Extract section name
+            match = re.search(r"\d+\. (.+)", header_block)
+            if match and match.group(1) in keep:
+                brief_parts.append(header_block + content.rstrip())
+            i += 2
+        report = "\n\n".join(brief_parts)
+        while "\n\n\n" in report:
+            report = report.replace("\n\n\n", "\n\n")
 
     if args.output:
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)

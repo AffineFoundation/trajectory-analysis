@@ -19,6 +19,7 @@ LiveWeb 轨迹分析引擎迭代
 5. 最开始给我 top findings 要求根据我分析报告背后的意图给出最优价值的 top findings
 7. 环境相关代码的提升点 理解环境背后设计意图 要求多角度充分论证，不得给出不扎实的意见
 8. 给出由于网络，评测环境 等导致任务无法有效提取信息的 可疑task id, 要求多次多角度审视，特别强调不是agent自身原导致的
+9. 优化parser failed error 做进一步筛选， 对于LLM 正确回答但是因为我们评判太严格的才能划归这个目录。大部分回答 praser error 是因为他自己没能按标准格式回答的不用划到这个列表
 
 每次迭代工作流
 0. https://github.com/AffineFoundation/liveweb-arena.git（所有代码都会随时更新）确保所有分析都基于最新代码
@@ -32,6 +33,154 @@ LiveWeb 轨迹分析引擎迭代
 8. 重点寻找下是否由于环境设计，基建设等问题导致轨迹失败/甚至评分有偏差的问题，重点分析，反复论证 给出可疑的轨迹&原因
 
 待办工作区
+
+### 迭代 31 (2026-03-22) — 新插件同步 + 问题类型分类器大幅升级
+
+**变更**:
+- [x] KNOWN_SITES 同步 liveweb-arena 最新代码: 新增 `arxiv.org`, `open-meteo.com` (共 7 个活跃插件站点)
+- [x] 注释更新: 新增 arxiv plugin (5 templates), openmeteo plugin (4 templates, with cache support)
+- [x] `_ALL_ACTION_NAMES` 注释标注 11 个 action types (确认 press 已在集合中)
+- [x] `KNOWN_EXTERNAL_SITES` 增加 `scholar.google.com`
+- [x] 问题类型分类器从 9→17 种类型 (新增 8 种):
+  - `subnet/network` (27 tasks, 22%): taostats subnet/validator/emission 查询
+  - `comparison` 扩展 (54→127 tasks): 新增 "performed better/worse", "closest to high/low", "biggest", "most"
+  - `identify/lookup` (20 tasks, 15%): "name of", "find the", "retrieve"
+  - `filter/threshold` (18 tasks, **0%**): "find any that gained more than X%", anomaly/outlier
+  - `calculate` (5 tasks, **0%**): "calculate the percentage of", "compute"
+  - `weather` / `paper/author` / `book/library` / `news/article`: 为新插件预置分类
+  - `price` 扩展: 新增 "trading at", "currently at"
+- [x] "other" 从 191→43 tasks (**77% 缩减**), 不再是最大分类
+- [x] OPT-6 跳过 "other" catch-all, 显示下一个可操作类型 (identify/lookup)
+
+**关键新发现**:
+- **filter/threshold 0% accuracy (18 tasks)**: 阈值筛选查询全部失败 — SFT 高优先级目标
+- **calculate 0% (5 tasks)**: 计算类查询全部失败
+- **comparison 精度分裂**: 显式关键词 ("vs", "compare") 33% vs 隐式表达 ("performed better") 15%
+  - 新增的 73 个 comparison tasks 准确率仅 15.1%, 远低于原有 54 个 (33.3%)
+  - 结论: agent 理解显式比较好于隐式比较, SFT 应侧重隐式表达
+- **MVD gaps 更准确**: calculate(+30), filter/threshold(+30), news(+30) 现在可见
+
+**对抗性不足 (迭代 32 已解决)**:
+- ~~first-match 顺序问题~~ → 用 question_type × nav_root_cause 交叉表直接展示每种类型的真实失败原因
+- ~~小样本显著性~~ → 添加 † 标记 (n<10) + 交叉表仅显示 n≥5
+
+### 迭代 32 (2026-03-22) — 问题类型根因交叉分析 + 弱项根因标注
+
+**变更**:
+- [x] 新增 `Question Type × Root Cause` 交叉表 (Section 5)
+  - 14 种问题类型 × 4 种导航根因, 仅显示 n≥5
+  - 每行末尾标注 `primary` 根因: extract(54%), budget(55%) 等
+  - 自动生成 Extraction-blocked / Budget-blocked 分类
+- [x] Per-question-type accuracy 表增加 `†` 小样本标记 (n<10)
+- [x] SFT WEAKNESS TARGETS 弱项类型增加根因标注
+  - 例: `comparison(23%,budget)`, `supply(30%,extract)` — 即刻可操作
+- 报告 480→503 行 (+23 行 for 交叉表)
+
+**关键新发现**:
+- **Budget-dominant 类型**: comparison(55%), filter/threshold(63%), ranking(51%), calculate(60%)
+  - 这些查询需要跨多资产/多页面操作, 步数预算不足是主因
+  - SFT 策略: 教 agent 高效导航, 减少无效步骤
+- **Extraction-dominant 类型**: ath/range(75%), subnet/network(64%), supply(61%), convert(62%)
+  - 这些查询 agent 到了正确页面但提取错误数据
+  - SFT 策略: 教精确数据提取 + accessibility tree 解读
+- **price(54% extract) 是最大改善杠杆**: 202 个错误答案中 110 个是提取失败, 单一类型影响最大
+
+**对抗性不足 (迭代 33 已解决)**:
+- ~~同质化~~ → 改为 budget-dominant vs extract-dominant vs mixed 三组分类
+- ~~50/50 边界误导~~ → gap<10pp 的类型标为 mixed(Nb/Ne)
+
+### 迭代 33 (2026-03-22) — 根因三分法 (budget/extract/mixed) + SFT 标注一致性
+
+**变更**:
+- [x] 交叉表 `primary` 列改为三分法:
+  - `budget(N%)`: budget > extract 超过 10pp
+  - `extract(N%)`: extract > budget 超过 10pp
+  - `mixed(Nb/Ne)`: gap <10pp, 显示双方百分比
+- [x] Root cause insight 从单侧 extraction-blocked → 三组:
+  - Budget-limited: comparison(55%), filter/threshold(63%), calculate(60%)
+  - Extraction-limited: price(54%), ath/range(75%), supply(62%), etc.
+  - Mixed: change_%, ranking, other, volume
+- [x] SFT WEAKNESS TARGETS 根因标注同步使用 mixed 逻辑
+  - 例: `other(28%,mixed)` 不再误标为 extract
+- 报告 503→517 行 (+14 for 更丰富的 insight)
+
+**关键验证**:
+- change_%(47b/47e) ✅ 正确标为 mixed
+- ranking(51b/49e) ✅ 正确标为 mixed
+- volume(50b/50e) ✅ 完美 50/50 → mixed
+- comparison(55% budget) ✅ 清晰 budget-dominant
+- ath/range(75% extract) ✅ 清晰 extract-dominant
+
+**UID 153 最终数据 (300 tasks, sampling list)**:
+- Avg 0.173 | Perfect 2% | Zero 56% | 100% multi-site
+- Root cause: extract 52% | budget 42% | no-visit 6%
+- Budget-dominant 类型: comparison, filter/threshold, calculate
+- Extraction-dominant 类型: price, ath/range, supply, subnet/network, identify/lookup, convert
+- Mixed 类型: change_%, ranking, other, volume
+
+**对抗性不足 (迭代 34 已解决)**:
+- ~~extraction-limited 无优先级~~ → 每组增加 n= 计数并按数量降序排列
+
+### 迭代 34 (2026-03-22) — Parse_failed 答案恢复分析 + 根因优先级排序
+
+**变更**:
+- [x] Parse_failed 答案恢复分析 (直接回应需求 #9):
+  - 对 bare_json/xml_tool_call 模式, 从 content 文本提取 JSON 答案
+  - 支持 dict 格式 `{"answer1":"..."}` 和 list 格式 `["..."]`
+  - 嵌套 brace 解析 + XML tag 清理 + 容错 (missing closing brace)
+  - 与 expected answer 模糊比较 (exact match + numeric within 1%)
+- [x] Root cause insight 各组内增加 `n=` 计数, 按数量降序排列
+  - 使优先级一目了然: price(n=202) >> convert(n=13)
+
+**关键发现 — 需求 #9 的最终答案**:
+- **28 个 parse_failed tasks 中**:
+  - 12/28 JSON extractable (能从 content 解析出答案)
+  - **5 tasks 含正确答案** (6/17 subtasks 精确匹配 expected)
+  - 16/28 不可提取 (plain_text 或严重格式错误)
+- **结论**: 5 个任务 (18%) 是 "LLM 正确回答但因格式被拒" — 可通过环境 fallback JSON 解析恢复
+  - Recoverable IDs: 17012025, 26265391, 37170337, 66187124, 67433603
+  - 剩余 23 个是 agent 真正的格式/答案问题
+- **建议**: 环境添加 fallback: 若 tool_calls 解析失败, 尝试从 content 提取 JSON → 可挽救 ~2% 采样数据
+
+**对抗性不足 (迭代 35 已解决)**:
+- ~~匹配逻辑不对齐~~ → 确认 env 使用 LLM-based validation, 拓宽匹配并标注 conservative
+
+### 迭代 35 (2026-03-22) — 评分机制发现 + 恢复分析对齐
+
+**重大发现**: liveweb-arena 使用 **LLM-based validation** (不是精确字符串匹配)
+- `liveweb_arena/core/validators/llm_validator.py` — LLM prompt: "Be flexible with format differences"
+- parse_failed 得 0 分的根因: `AnswerParser` 无法从 content 提取答案 → validator 看到 `actual=None` → "No answer provided" → 0 分
+- **不是因为答案错误, 而是因为答案没被传递给评分器**
+
+**变更**:
+- [x] 恢复匹配拓宽 (对齐 LLM validator 的宽松标准):
+  - whitespace/punctuation 归一化
+  - 数值容差从 1% → 5%
+  - 子串包含匹配 (min 3 chars)
+- [x] Forensics 增加 NOTE: 标注 env 使用 LLM validator, 我们的匹配仍偏保守
+- [x] 恢复率显著提升:
+  - 迭代 34: 5 tasks, 6/17 subtasks
+  - **迭代 35: 8 tasks, 10/28 subtasks (+60% 恢复)**
+  - 8/27 = 30% parse_failed 含可恢复的正确答案
+
+**环境改进建议 (加强证据)**:
+- `AnswerParser` 应增加 fallback: tool_calls 解析失败时, 尝试从 content 提取 JSON
+- 预期影响: 恢复 ~30% parse_failed tasks (8/27), 对应 ~3% 采样数据
+- 实际恢复率可能更高 (LLM validator 比我们的匹配更宽松)
+
+**对抗性不足 (迭代 36 已解决)**:
+- ~~报告篇幅增长~~ → 合并两表 + NOTE 压缩, 526→506 行 (-20)
+
+### 迭代 36 (2026-03-22) — 报告精简: 合并问题类型双表 + 压缩 NOTE
+
+**变更**:
+- [x] 合并 per-question-type accuracy 表 + Question Type × Root Cause 交叉表为单一 "Question Type Performance + Root Cause" 表
+  - 新增 `n` (subtask count) + `acc%` 列到 root cause 交叉表
+  - 按 accuracy 降序排列, 一目了然: supply(31%) → calculate(0%†)
+  - 删除独立 accuracy 表 (-18 行)
+- [x] Recovery NOTE 从 3 行 → 1 行脚注
+- [x] 新增 small sample footnote: `(small sample types: news/article(0%,n=3))`
+- 报告 526→506 行 (-20, -3.8%)
 
 ### 已完成迭代摘要 (迭代 1-6, 2026-03-14)
 
@@ -214,8 +363,66 @@ LiveWeb 轨迹分析引擎迭代
   - 高价值 flags (ZERO_INTERACTION, UNVISITED_CORRECT, VM_LOOP) 仍逐条展示
   - 新发现: parse_failed 的 site 分布为 taostats(67), stooq(4), coingecko(4) — taostats 查询占绝对多数
 
-**对抗性不足 (迭代 27 待办)**:
-- Section 8 SFT STRATEGY (105 行) 是第二大 section，部分内容与 Section 7 OPT 重叠 (例如 multi-site navigation 同时出现在 OPT-1 和 SFT Strategy 1)。且 SFT Per-website recommendations 与 Section 3 Per-website accuracy 数据重复展示。应精简 SFT section 中与其他 section 重复的数据，只保留 SFT-specific 的 insight (数据来源/合成策略/MVD)。
+### 迭代 27 (2026-03-19) — SFT section 精简 + 报告总量 -26%
+
+**变更**:
+- [x] SFT Strategies 3-5 合并为 "WEAKNESS TARGETS" compact 格式 (6行替代~45行)
+  - Per-website: 每站一行 "site (acc%, n=N): teach navigation/extraction"
+  - Question types: 一行列出所有 <30% 类型
+  - 引用 Sections 3, 5 避免重复数据
+- SFT section: 105→79 行 (-25%)
+- 报告总量: 687→510 行 (累计 -26%)
+
+**Section 分布 (最终)**:
+- Wrong Answer: 76 | SFT: 79 | Action: 58 | Multi-site: 52 | 6b: 45 | OPT: 42 | Website: 39 | Score: 25 | Exec: 21 | Memo: 23 | Forensics: 15
+
+### 迭代 28 (2026-03-19) — Section 5 去重 + 报告 489 行
+
+**变更**:
+- [x] 移除 "wrong answer classification" 表 (cross-tab total 列已包含)
+- [x] 移除 "completely_wrong breakdown" 表 (合并到 cross-tab insight 行)
+- [x] 移除 "navigation-aware root cause" 表 (cross-tab TOTAL 行已包含)
+- [x] Insight 块合并为 3 行: root cause 百分比 + sub-class 分布
+- Section 5: 76→55 行 (-28%), 报告总量 510→489 行 (累计 -29%)
+
+**Section 分布 (489 行)**:
+- SFT: 79 | Action: 58 | Wrong Answer: 55 | Multi-site: 52 | 6b: 45 | OPT: 42 | Website: 39 | Score: 25 | Memo: 23 | Exec: 21 | Forensics: 15
+
+### 迭代 29 (2026-03-19) — Comparison report 升级
+
+**变更**:
+- [x] Comparison OVERVIEW 增加 AdjZero% 列
+- [x] NAVIGATION PATTERN 增加 browser_steps, click_role, type, parse_failed% 指标
+  - 关键发现: UID 153 parse_failed 8.0% vs UID 45 仅 1.6%
+
+### 迭代 30 (2026-03-19) — parse_failed 根因验证 + 分类修正
+
+**验证方法**: 逐条检查 24 个 parse_failed task 的最后一条 assistant message
+
+**验证结论**: parse_failed 是 **agent 格式错误**，不是环境 bug
+- 24/24 任务的 stop action 都没有被成功解析为 tool_call
+- Agent 在 content 文本中输出了答案，但格式不符合 FunctionCallingProtocol
+
+**三种失败模式**:
+| 模式 | 数量 | 描述 |
+|------|------|------|
+| bare_json | 15 (63%) | 裸 JSON `{"name":"stop",...}` 在 content 中，不在 tool_calls 数组 |
+| plain_text | 5 (21%) | 纯文本 "I need to provide answers..." 从未调用 stop |
+| xml_tool_call | 4 (17%) | `</think><tool_call>{...}` 思考链格式，环境不识别 |
+
+**脚本变更**:
+- [x] TOP FINDINGS: "Environment issues" → "Agent format failures" + 模式细分
+- [x] Forensics: PARSE_FAILED 从 env_tasks 移到 agent_tasks
+  - 标签改为 `[AGENT FORMAT ERROR]`
+  - 增加 format mode breakdown 和 root cause 说明
+- [x] Comparison AdjZero%: 仅排除 empty_tasks (真正环境问题)，不再排除 parse_failed
+  - 脚注改为 "excludes empty tasks only; parse_failed is agent error"
+- [x] SFT 建议: 增加 function-calling 格式训练 + 环境 fallback JSON 解析
+
+**影响**:
+- 之前: "11% 环境问题, adjusted zero-rate 46%" (错误)
+- 现在: "3% 环境问题 (empty tasks), 8% agent 格式问题" (正确)
+- UID 153 的 adjusted zero-rate 应更高 (~50%), 因为 parse_failed 是 agent 的问题
 
 ### 迭代 16 (2026-03-17) — MVD 估算 + 环境代码级优化 + Session 精简
 
@@ -283,3 +490,6 @@ LiveWeb 轨迹分析引擎迭代
 7. **[NEW] 记忆化/世界知识泄漏**: 10.3% tasks 零导航得分 (avg 0.463 vs nav tasks 0.140)，task 9054548 零交互 score 0.50
 8. **[NEW] wrong_entity/metric 是 catch-all**: 占 completely_wrong 的 84.5%，未区分「到了对的页面提取错字段」vs「从未到达页面」vs「步数耗尽」— 迭代 13 已加导航感知归因
 9. **[CRITICAL] 评估接受世界知识答案**: 3 tasks EXACT MATCH 未浏览得分 (NASDAQ=24533.58, τemplar, grail)。评估器未强制要求 agent 必须通过浏览器获取数据，stop action 提交的 LLM 猜测可直接得分。这是环境设计漏洞，会奖励记忆化而非浏览能力。
+10. **[迭代30验证] parse_failed 是 agent 格式错误**: 24 tasks (8%) 中 agent 将 stop action 写在 content 文本而非 tool_calls 数组。三种模式: bare_json(15), plain_text(5), xml_tool_call(4)。**之前误归为环境问题，已修正**。SFT 应加 function-calling 格式训练。环境可 fallback 解析 content 中的 JSON 挽救 19/24 任务。
+11. **[迭代31] filter/threshold 与 calculate 查询 0% accuracy**: 18 个阈值筛选 + 5 个计算类查询全部失败。这些查询需要 agent 理解条件判断和聚合运算，而非简单数据查找。隐式比较 ("performed better") 准确率也仅 15% vs 显式 33%。
+12. **[迭代34→35] parse_failed 中 8 个任务含正确答案 (30%)**: 27 个 parse_failed 中 11 个可提取 JSON, 其中 8 个 (10/28 subtasks) 匹配 expected answer。根因: env 的 AnswerParser 无法从 content 提取答案 → LLM validator 看到 None → 0 分。**不是答案错误, 是答案没被传递给评分器**。环境添加 fallback JSON 解析可挽救 ~3% 采样数据, 实际恢复率可能更高 (env 使用 LLM validator, 比我们的匹配更宽松)。

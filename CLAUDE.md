@@ -58,9 +58,11 @@ Each script supports `--output/-o` to write to file, `--all` for all historical 
 python3 scripts/analyze_game.py --uid 42
 python3 scripts/analyze_game.py --uid 42 --all -o reports/game_uid42_all.txt
 
-# SWE-SYNTH (software engineering tasks)
+# SWE-INFINITE (software engineering tasks)
 python3 scripts/analyze_swe.py --uid 42
 python3 scripts/analyze_swe.py --uid 42 --all -o reports/swe_uid42_all.txt
+python3 scripts/analyze_swe.py --uid 42 --miniswe-only  # exclude codex (even task_ids)
+python3 scripts/analyze_swe.py --uid 42 --all --miniswe-only --export-wins -o wins.json  # SFT data
 
 # LIVEWEB (web interaction / browser automation)
 python3 scripts/analyze_liveweb.py --uid 42
@@ -80,6 +82,10 @@ python3 scripts/analyze_navworld.py --uid 42 --all -o reports/navworld_uid42_all
 | `--limit N` | yes | yes | yes | - |
 | `--recent N` | - | yes | yes | yes |
 | `--compare` | - | `--compare 120,162` | `--compare 30 60` | `--compare 78` |
+| `--miniswe-only` | - | yes | - | - |
+| `--export-wins` | - | yes | - | - |
+| `--brief` | - | yes | - | - |
+| `--export-sft` | - | yes | - | - |
 | `--multi-compare` | - | - | - | `--multi-compare 57,78,142` |
 | `--verbose` | - | - | yes | - |
 | `--deep TASK_ID` | - | - | - | yes |

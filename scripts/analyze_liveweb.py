@@ -32,11 +32,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # ── Constants ────────────────────────────────────────────────────────────────
 
 # Known websites that appear in LIVEWEB tasks
-# Active LiveWeb Arena plugin sites (from liveweb-arena repo, 2026-03-19)
+# Active LiveWeb Arena plugin sites (from liveweb-arena repo, 2026-03-22)
 # hybrid plugin combines coingecko + stooq, weather plugin (wttr.in) disabled
+# New since 03-19: arxiv plugin (arxiv.org), openmeteo plugin (open-meteo.com)
 KNOWN_SITES = [
     "stooq.com", "taostats.io", "coingecko.com",
     "news.ycombinator.com", "openlibrary.org",
+    "arxiv.org", "open-meteo.com",
 ]
 
 # Legacy/external sites that may appear in goto URLs but are NOT plugin sites
@@ -47,6 +49,7 @@ KNOWN_EXTERNAL_SITES = [
     "macrotrends.net", "companiesmarketcap.com", "statista.com",
     "worldometers.info", "duckduckgo.com", "google.com", "bing.com",
     "weather.com", "openweathermap.org", "wttr.in",
+    "scholar.google.com",
 ]
 
 # Domains that look like websites but are actually crypto/project names
@@ -59,7 +62,8 @@ FALSE_POSITIVE_DOMAINS = {
 # Question type classification patterns
 _QUESTION_TYPE_PATTERNS = [
     ("price", [r"\bprice\b", r"\bcurrent price\b", r"\bspot price\b",
-               r"\blast price\b", r"\bclosing price\b", r"\bopen price\b"]),
+               r"\blast price\b", r"\bclosing price\b", r"\bopen price\b",
+               r"\btrading at\b", r"\bcurrently at\b", r"\bquoted at\b"]),
     ("volume", [r"\bvolume\b", r"\btrading volume\b", r"\b24h volume\b",
                 r"\bdaily volume\b"]),
     ("change_%", [r"\bchange\b.*%", r"\b%\s*change\b", r"\bpercentage change\b",
@@ -75,11 +79,36 @@ _QUESTION_TYPE_PATTERNS = [
     ("comparison", [r"\bcompare\b", r"\bvs\b", r"\bversus\b",
                     r"\bhigher\b.*\bor\b", r"\blower\b.*\bor\b",
                     r"\bwhich\b.*\bmore\b", r"\bwhich\b.*\bless\b",
-                    r"\bdifference between\b"]),
+                    r"\bdifference between\b",
+                    r"\bperformed\s+(better|worse)\b", r"\bwhich\b.*\bcheapest\b",
+                    r"\bclosest to\b.*\b(high|low)\b", r"\bnearest to\b.*\b(high|low)\b",
+                    r"\bwhich\b.*\bbiggest\b", r"\bwhich\b.*\bmost\b",
+                    r"\bwhich\b.*\blost the most\b", r"\bup or down\b"]),
     ("count/how_many", [r"\bhow many\b", r"\bcount\b", r"\bnumber of\b",
                         r"\btotal number\b"]),
     ("convert", [r"\bconvert\b", r"\bin\s+(usd|eur|gbp|btc|eth)\b",
                  r"\bexchange rate\b", r"\bconversion\b"]),
+    ("weather", [r"\btemperature\b", r"\bweather\b", r"\bforecast\b",
+                 r"\bwind\b", r"\bhumidity\b", r"\bprecipitation\b",
+                 r"\brain\b.*\bchance\b", r"\bsnow\b"]),
+    ("paper/author", [r"\bpaper\b", r"\bauthor\b", r"\barxiv\b",
+                      r"\bcategory\b.*\bpaper\b", r"\btitle\b.*\bpaper\b",
+                      r"\bpublication\b", r"\babstract\b"]),
+    ("subnet/network", [r"\bsubnet\b", r"\bvalidator\b", r"\bemission\b",
+                        r"\bregistration\b", r"\bstaking\b", r"\bdelegat",
+                        r"\btao\b", r"\bbittensor\b", r"\bnetuid\b"]),
+    ("identify/lookup", [r"\bname of\b", r"\bidentify\b", r"\bwhat is the\b.*\bfor\b",
+                          r"\bfind the\b", r"\blook up\b", r"\bretrieve\b"]),
+    ("book/library", [r"\bbook\b", r"\bauthor\b.*\bwrote\b", r"\bisbn\b",
+                      r"\bpublisher\b", r"\blibrary\b", r"\bfirst.edition\b"]),
+    ("news/article", [r"\bnews\b", r"\bstory\b", r"\bstories\b", r"\barticle\b",
+                      r"\bpoints\b.*\bhacker\b", r"\bcomment\b.*\bhacker\b",
+                      r"\bhacker\s*news\b", r"\bupvote\b"]),
+    ("filter/threshold", [r"\bfind any\b.*\bthat\b", r"\bfilter\b", r"\bthreshold\b",
+                          r"\banomaly\b", r"\boutlier\b", r"\bmore than\b.*%",
+                          r"\bgained more than\b", r"\blost more than\b"]),
+    ("calculate", [r"\bcalculate\b", r"\bcompute\b", r"\bwhat percentage\b",
+                   r"\bpercentage of\b", r"\bratio\b", r"\baverage\b.*\bacross\b"]),
 ]
 
 # Browser action patterns in conversation (fallback regex for non-tool-call formats)
@@ -91,6 +120,7 @@ _ACTION_PATTERNS = {
 }
 
 # All action types from liveweb-arena agent_protocol.py
+# All 11 action types from liveweb-arena agent_protocol.py BROWSER_ACTIONS
 _ALL_ACTION_NAMES = {
     "goto", "click", "scroll", "view_more", "type", "press",
     "wait", "click_role", "type_role", "stop",
@@ -841,25 +871,38 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
                 f"3+ site tasks: 0/{len(three_plus)} perfect — structurally unsolvable at current capability"
             )
 
-    # Finding: Parse failures (environment issue)
+    # Finding: Parse failures (agent format error) + empty tasks (env issue)
     parse_failed_tasks = [t for t in parsed
                           if t.failure_reason and "parse" in str(t.failure_reason).lower()]
     empty_tasks = [t for t in parsed if t.num_subtasks == 0]
-    env_issue_count = len(parse_failed_tasks) + len(empty_tasks)
-    if env_issue_count >= 3:
-        adj_zero = zero_count - len([t for t in parse_failed_tasks if t.is_zero]) \
-                   - len([t for t in empty_tasks if t.is_zero])
-        adj_n = n - env_issue_count
-        adj_rate = adj_zero / adj_n * 100 if adj_n > 0 else 0
-        parts = []
-        if parse_failed_tasks:
-            parts.append(f"{len(parse_failed_tasks)} parse failures")
-        if empty_tasks:
-            parts.append(f"{len(empty_tasks)} empty tasks")
+    if parse_failed_tasks:
+        # Classify parse failure modes by inspecting last assistant message
+        pf_modes = {"bare_json": 0, "xml_tool_call": 0, "plain_text": 0, "other": 0}
+        for t in parse_failed_tasks:
+            asst_msgs = [m for m in t.conversation if m.get("role") == "assistant"]
+            if not asst_msgs:
+                pf_modes["other"] += 1
+                continue
+            content = str(asst_msgs[-1].get("content", "") or "")
+            tc = asst_msgs[-1].get("tool_calls") or []
+            if tc:
+                pf_modes["other"] += 1
+            elif "<tool_call>" in content or "<tool>" in content:
+                pf_modes["xml_tool_call"] += 1
+            elif '"name"' in content and '"arguments"' in content:
+                pf_modes["bare_json"] += 1
+            else:
+                pf_modes["plain_text"] += 1
+        mode_parts = [f"{v} {k}" for k, v in sorted(pf_modes.items(), key=lambda x: -x[1]) if v > 0]
         findings.append(
-            f"Environment issues: {env_issue_count} tasks ({env_issue_count / n * 100:.0f}%) "
-            f"fail due to {' + '.join(parts)}, not agent capability "
-            f"(adjusted zero-rate: {adj_rate:.0f}% vs raw {zero_rate:.0f}%)"
+            f"Agent format failures: {len(parse_failed_tasks)} tasks ({len(parse_failed_tasks) / n * 100:.0f}%) "
+            f"output stop action in wrong format ({', '.join(mode_parts)}) — "
+            f"SFT target for function-calling compliance"
+        )
+    if empty_tasks and len(empty_tasks) >= 3:
+        findings.append(
+            f"Environment issues: {len(empty_tasks)} tasks ({len(empty_tasks) / n * 100:.0f}%) "
+            f"have 0 subtasks (task initialization failure)"
         )
 
     # Finding: Token waste
@@ -1195,21 +1238,8 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
     p("")
 
     if all_wrong:
-        # Classification distribution
-        p("  Wrong answer classification:")
-        wa_class = Counter(w["classification"] for w in all_wrong)
-        for cls, cnt in wa_class.most_common():
-            p(f"    {cls:<20} {cnt:>4} ({cnt / len(all_wrong) * 100:>5.1f}%)")
-        p("")
-
-        # completely_wrong breakdown
+        # Examples of wrong answer sub-types (quick reference)
         if cw_answers:
-            p("  completely_wrong breakdown:")
-            for sub, cnt in cw_sub.most_common():
-                p(f"    {sub:<25} {cnt:>4} ({cnt / len(cw_answers) * 100:>5.1f}%)")
-            p("")
-
-            # Examples of each sub-class
             p("  completely_wrong examples:")
             shown_subs = set()
             for w in cw_answers:
@@ -1225,10 +1255,7 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
                 p(f"      Actual:   {actual_str}")
             p("")
 
-        # Per-question-type accuracy
-        p("  Per-question-type accuracy:")
-        p(f"  {'Type':<20} {'Total':>5} {'Correct':>7} {'Acc%':>6}")
-        p("  " + chr(9472) * 42)
+        # Pre-compute qtype_stats (used by cross-tab and SFT section)
         qtype_stats = []
         for qtype in sorted(qtype_groups.keys()):
             entries = qtype_groups[qtype]
@@ -1240,9 +1267,7 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
             qt_acc = qt_correct / qt_total * 100 if qt_total else 0
             qtype_stats.append((qtype, qt_total, qt_correct, qt_acc))
         qtype_stats.sort(key=lambda x: -x[3])  # Sort by accuracy descending
-        for qtype, qt_total, qt_correct, qt_acc in qtype_stats:
-            p(f"  {qtype:<20} {qt_total:>5} {qt_correct:>7} {qt_acc:>5.1f}%")
-        p("")
+        # (per-question-type accuracy is shown in the combined cross-tab below)
 
         # Wrong answers by website
         p("  Wrong answers by website:")
@@ -1252,17 +1277,8 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
             p(f"    {site:<30} {cnt:>4} wrong / {site_total:>4} total ({cnt / site_total * 100:.0f}%)" if site_total else f"    {site:<30} {cnt:>4} wrong")
         p("")
 
-        # Navigation-aware wrong answer breakdown
-        # (uses pre-computed rc_ values from TOP FINDINGS)
-        p("  Wrong answer root cause (navigation-aware):")
-        p(f"    Budget exhausted:             {rc_budget:>4} ({rc_budget / total_wrong_pre * 100:>5.1f}%)" if total_wrong_pre else "")
-        p(f"    Visited but wrong extraction: {rc_wrong_extract:>4} ({rc_wrong_extract / total_wrong_pre * 100:>5.1f}%)" if total_wrong_pre else "")
-        p(f"    No navigation at all:         {rc_no_nav:>4} ({rc_no_nav / total_wrong_pre * 100:>5.1f}%)" if total_wrong_pre else "")
-        p(f"    Never visited required site:  {rc_never:>4} ({rc_never / total_wrong_pre * 100:>5.1f}%)" if total_wrong_pre else "")
-        p("    (See SFT IMPROVEMENT PRIORITY RANKING for actionable breakdown)")
-        p("")
-
         # Cross-tabulation: wrong answer classification × navigation root cause
+        # (replaces separate classification + root cause tables — see TOTAL row/column)
         p("  Classification × Navigation Root Cause:")
         nav_causes = ["budget_exhausted", "wrong_extraction", "never_visited", "no_navigation"]
         nav_cause_labels = {
@@ -1301,18 +1317,111 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
         p("  " + " ".join(parts))
         p("")
 
-        # Insight: what fraction of completely_wrong is actually budget vs extraction
+        # Question Type: accuracy + root cause combined table
+        # Merges per-question-type accuracy with root cause cross-tab for conciseness
+        p("  Question Type Performance + Root Cause:")
+        qt_rc_data = defaultdict(lambda: defaultdict(int))
+        qt_rc_totals = Counter()
+        for w in all_wrong:
+            qt = w.get("qtype", "other")
+            rc = w.get("_nav_root_cause", "unknown")
+            qt_rc_data[qt][rc] += 1
+            qt_rc_totals[qt] += 1
+
+        # Build lookup for accuracy
+        qt_acc_map = {qt: (total, acc) for qt, total, _, acc in qtype_stats}
+
+        # Show all types sorted by accuracy descending (n≥5 wrong for root cause)
+        qt_rc_types = [(qt, cnt) for qt, cnt in qt_rc_totals.most_common()
+                       if cnt >= 5]
+        if qt_rc_types:
+            header_parts = [f"{'question_type':<20} {'n':>4} {'acc%':>5}"]
+            for nc in nav_causes:
+                header_parts.append(f"{nav_cause_labels[nc]:>7}")
+            header_parts.append(f"{'primary':>14}")
+            p("  " + " ".join(header_parts))
+            p("  " + chr(9472) * (20 + 5 + 6 + 7 * len(nav_causes) + 15))
+
+            # Classify each type by dominant root cause (budget vs extract)
+            budget_dominant = []   # budget > extract by >10pp
+            extract_dominant = []  # extract > budget by >10pp
+            mixed_types = []       # budget ≈ extract (gap <10pp)
+
+            # Sort by accuracy descending (matching qtype_stats order)
+            qt_rc_types_sorted = sorted(qt_rc_types, key=lambda x: qt_acc_map.get(x[0], (0, 0))[1], reverse=True)
+            for qt, total in qt_rc_types_sorted:
+                qt_n, qt_acc = qt_acc_map.get(qt, (0, 0))
+                flag = "†" if qt_n < 10 else ""
+                parts = [f"{qt:<20} {qt_n:>4} {qt_acc:>4.0f}%{flag}"]
+                rc_counts = {}
+                for nc in nav_causes:
+                    cnt = qt_rc_data[qt].get(nc, 0)
+                    rc_counts[nc] = cnt
+                    parts.append(f"{cnt:>7}")
+                # Compare budget vs extract share
+                b_pct = rc_counts.get("budget_exhausted", 0) / total * 100
+                e_pct = rc_counts.get("wrong_extraction", 0) / total * 100
+                gap = abs(b_pct - e_pct)
+                if gap < 10:
+                    parts.append(f"mixed({b_pct:.0f}b/{e_pct:.0f}e)")
+                    mixed_types.append((qt, b_pct, e_pct))
+                elif b_pct > e_pct:
+                    parts.append(f"budget({b_pct:.0f}%)")
+                    budget_dominant.append((qt, b_pct))
+                else:
+                    parts.append(f"extract({e_pct:.0f}%)")
+                    extract_dominant.append((qt, e_pct))
+                p("  " + " ".join(parts))
+
+            # Show types not in cross-tab (< 5 wrong answers) as footnote
+            small_types = [(qt, total, acc) for qt, total, _, acc in qtype_stats
+                           if qt_rc_totals.get(qt, 0) < 5 and total >= 3]
+            if small_types:
+                st_str = ", ".join(f"{qt}({acc:.0f}%,n={total})" for qt, total, acc in small_types)
+                p(f"  (small sample types: {st_str})")
+            if any(qt_n < 10 for qt, _ in qt_rc_types for qt_n, _ in [qt_acc_map.get(qt, (0, 0))]):
+                p("  (†n<10)")
+            p("")
+            # Actionable insight: balanced budget vs extract split
+            # Include wrong answer count (n=) for prioritization within groups
+            if budget_dominant or extract_dominant or mixed_types:
+                p("  Root cause insight by question type:")
+                if budget_dominant:
+                    # Sort by wrong answer count descending for priority
+                    bt_items = sorted(
+                        [(qt, pct, qt_rc_totals[qt]) for qt, pct in budget_dominant],
+                        key=lambda x: -x[2])
+                    bt_str = ", ".join(f"{qt}({pct:.0f}%,n={cnt})" for qt, pct, cnt in bt_items)
+                    p(f"    Budget-limited (need more steps): {bt_str}")
+                if extract_dominant:
+                    et_items = sorted(
+                        [(qt, pct, qt_rc_totals[qt]) for qt, pct in extract_dominant],
+                        key=lambda x: -x[2])
+                    et_str = ", ".join(f"{qt}({pct:.0f}%,n={cnt})" for qt, pct, cnt in et_items)
+                    p(f"    Extraction-limited (right site, wrong data): {et_str}")
+                if mixed_types:
+                    mt_items = sorted(
+                        [(qt, qt_rc_totals[qt]) for qt, _, _ in mixed_types],
+                        key=lambda x: -x[1])
+                    mt_str = ", ".join(f"{qt}(n={cnt})" for qt, cnt in mt_items)
+                    p(f"    Mixed (budget ≈ extraction): {mt_str}")
+                p("")
+        else:
+            p("  (insufficient data for cross-tab)")
+            p("")
+
+        # Insight: completely_wrong decomposition + sub-class info
         if cw_answers:
             cw_budget = sum(1 for w in cw_answers if w.get("_nav_root_cause") == "budget_exhausted")
             cw_extract = sum(1 for w in cw_answers if w.get("_nav_root_cause") == "wrong_extraction")
             cw_never = sum(1 for w in cw_answers if w.get("_nav_root_cause") == "never_visited")
-            p(f"  Insight: of {len(cw_answers)} completely_wrong answers:")
-            if cw_budget > 0:
-                p(f"    {cw_budget} ({cw_budget / len(cw_answers) * 100:.0f}%) from budget exhaustion — agent ran out of steps")
-            if cw_extract > 0:
-                p(f"    {cw_extract} ({cw_extract / len(cw_answers) * 100:.0f}%) from wrong extraction — agent reached site but read wrong data")
-            if cw_never > 0:
-                p(f"    {cw_never} ({cw_never / len(cw_answers) * 100:.0f}%) from never visiting — agent didn't navigate to required site")
+            p(f"  Insight: of {len(cw_answers)} completely_wrong ({len(cw_answers) / len(all_wrong) * 100:.0f}% of all wrong):")
+            p(f"    Root cause: budget={cw_budget}({cw_budget * 100 // len(cw_answers)}%) "
+              f"extraction={cw_extract}({cw_extract * 100 // len(cw_answers)}%) "
+              f"no-visit={cw_never}({cw_never * 100 // len(cw_answers)}%)")
+            # Sub-class breakdown in one line
+            sub_str = ", ".join(f"{s}({c})" for s, c in cw_sub.most_common())
+            p(f"    Sub-class: {sub_str}")
             p("")
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1810,9 +1919,9 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
         p("")
         opts.append("OPT-8: world knowledge bypass")
 
-    # OPT-6: Question type gaps
+    # OPT-6: Question type gaps (skip "other" — it's a catch-all, not actionable)
     for qtype, qt_total, qt_correct, qt_acc in qtype_stats:
-        if qt_total >= 5 and qt_acc < 20:
+        if qt_total >= 5 and qt_acc < 20 and qtype != "other":
             p(f"  [OPT-6] QUESTION TYPE GAP: {qtype} at {qt_acc:.0f}% accuracy ({qt_total} subtasks)")
             p(f"    Suggestion: focus SFT training on {qtype}-type queries")
             p("")
@@ -1885,53 +1994,39 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
     p("     Focus areas: wrong_entity/metric, verbose_wrong")
     p("")
 
-    # Strategy 3: Per-website SFT recommendations
-    p("  3. PER-WEBSITE SFT RECOMMENDATIONS:")
+    # Strategy 3: Weakness targets (condensed — see Sections 3 & 5 for full data)
+    p("  3. WEAKNESS TARGETS (see Sections 3, 5 for details):")
+    # Per-website: one line per weak site with SFT action
     for site, total, correct, acc, dnc, dnc_pct in site_stats[:8]:
-        if site == "unknown" or total < 3:
+        if site == "unknown" or total < 3 or acc >= 40:
             continue
-        if acc < 40:
-            p(f"     {site} ({acc:.0f}% accuracy, {total} subtasks):")
-            # Identify primary failure mode for this site
-            site_wrong = [w for w in all_wrong if w["website"] == site]
-            if site_wrong:
-                top_class = Counter(w["classification"] for w in site_wrong).most_common(1)
-                if top_class:
-                    p(f"       Primary failure: {top_class[0][0]} ({top_class[0][1]} occurrences)")
-            if dnc > 0:
-                p(f"       DNC (never visited): {dnc} ({dnc_pct:.0f}%)")
-                p(f"       SFT target: teach site navigation pattern for {site}")
-            else:
-                p(f"       SFT target: teach data extraction pattern for {site}")
-            p("")
-
-    # Strategy 4: Question type training priorities
-    p("  4. QUESTION TYPE TRAINING PRIORITIES:")
-    weakest_qtypes = [(qtype, qt_total, qt_correct, qt_acc)
-                      for qtype, qt_total, qt_correct, qt_acc in qtype_stats
-                      if qt_total >= 3 and qt_acc < 30]
+        action = "navigation" if dnc > total * 0.05 else "extraction"
+        p(f"     {site} ({acc:.0f}%, n={total}): teach {action}")
+    # Per-question-type: weakest types with root cause annotation
+    weakest_qtypes = [(qt, qt_total, qa) for qt, qt_total, _, qa in qtype_stats
+                      if qa < 30 and qt_total >= 5]
     if weakest_qtypes:
-        for qtype, qt_total, qt_correct, qt_acc in weakest_qtypes[:5]:
-            wrong_count = qt_total - qt_correct
-            p(f"     {qtype}: {qt_acc:.0f}% accuracy ({wrong_count} wrong of {qt_total})")
-    else:
-        p("     No question types below 30% accuracy threshold.")
+        qt_parts = []
+        for qt, qt_total, qa in weakest_qtypes[:6]:
+            # Determine dominant root cause: budget vs extract with mixed detection
+            qt_wrong = [w for w in all_wrong if w.get("qtype") == qt]
+            if qt_wrong:
+                n_wrong = len(qt_wrong)
+                b_cnt = sum(1 for w in qt_wrong if w.get("_nav_root_cause") == "budget_exhausted")
+                e_cnt = sum(1 for w in qt_wrong if w.get("_nav_root_cause") == "wrong_extraction")
+                b_pct = b_cnt / n_wrong * 100
+                e_pct = e_cnt / n_wrong * 100
+                if abs(b_pct - e_pct) < 10:
+                    rc_label = "mixed"
+                elif b_pct > e_pct:
+                    rc_label = "budget"
+                else:
+                    rc_label = "extract"
+                qt_parts.append(f"{qt}({qa:.0f}%,{rc_label})")
+            else:
+                qt_parts.append(f"{qt}({qa:.0f}%)")
+        p(f"     Weak question types: {', '.join(qt_parts)}")
     p("")
-
-    # Strategy 5: Wrong answer type priorities
-    if cw_answers:
-        p("  5. COMPLETELY_WRONG SUB-TYPE TRAINING:")
-        for sub, cnt in cw_sub.most_common():
-            p(f"     {sub}: {cnt} instances ({cnt / len(cw_answers) * 100:.0f}%)")
-            if sub == "wrong_entity/metric":
-                p("       -> Teach agent to precisely locate target entity in accessibility tree")
-            elif sub == "verbose_wrong":
-                p("       -> Teach output format constraints (concise value extraction)")
-            elif sub == "gave_up":
-                p("       -> Teach retry with different strategy (different URL path / extraction)")
-            elif sub == "format_mismatch":
-                p("       -> Teach number formatting normalization")
-        p("")
 
     # Improvement priority ranking (navigation-aware)
     p("  IMPROVEMENT PRIORITY RANKING (root-cause weighted):")
@@ -2202,24 +2297,146 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
     p("10. SUSPICIOUS TRAJECTORY FORENSICS")
     p("=" * 80)
     p("")
-    p("  Tasks flagged for potential environment/evaluation issues:")
+    p("  Tasks flagged for environment or agent format issues:")
     p("")
 
     flagged = []
 
-    # Flag E: Tasks with 0 subtasks (task initialization failure)
+    # Flag E: Tasks with 0 subtasks (task initialization failure — ENV issue)
     for t in parsed:
         if t.num_subtasks == 0:
             flagged.append((t, "EMPTY_TASK",
                             f"num_subtasks=0, steps={t.total_steps} — "
                             f"task may have failed to initialize (no answer_details)"))
 
-    # Flag F: Tasks with parse_failed failure reason (agent output parsing error)
+    # Flag F: Tasks with parse_failed — AGENT format error (not env issue)
+    # Agent outputs stop action in content text instead of tool_calls array
+    # Also attempt answer recovery: extract answers from content and compare with expected
+    parse_failed_recovery = []  # (task, mode, recovered_answers, match_count, total_subtasks)
     for t in parsed:
         if t.failure_reason and "parse" in str(t.failure_reason).lower():
+            # Classify the format error mode
+            asst_msgs = [m for m in t.conversation if m.get("role") == "assistant"]
+            mode = "unknown"
+            recovered_answers = []
+            if asst_msgs:
+                content = str(asst_msgs[-1].get("content", "") or "")
+                tc = asst_msgs[-1].get("tool_calls") or []
+                if tc:
+                    mode = "has_tc_but_invalid"
+                elif "<tool_call>" in content or "<tool>" in content:
+                    mode = "xml_tool_call"
+                elif '"name"' in content and '"arguments"' in content:
+                    mode = "bare_json"
+                else:
+                    mode = "plain_text"
+
+                # Attempt answer extraction from content for recoverable modes
+                if mode in ("bare_json", "xml_tool_call"):
+                    # Strategy 1: Find the outermost JSON blob containing "stop"+"answers"
+                    # Content may have <tool_call>JSON</tool_call> or bare JSON
+                    # Answers format: {"answer1": "...", "answer2": "..."} (dict) or ["...", "..."] (list)
+                    json_candidates = []
+                    # Strip XML tags if present
+                    clean = re.sub(r'</?tool_call>', '', content)
+                    # Find all JSON-like blobs (greedy nested braces)
+                    brace_depth = 0
+                    start = -1
+                    for ci, ch in enumerate(clean):
+                        if ch == '{':
+                            if brace_depth == 0:
+                                start = ci
+                            brace_depth += 1
+                        elif ch == '}':
+                            brace_depth -= 1
+                            if brace_depth == 0 and start >= 0:
+                                json_candidates.append(clean[start:ci+1])
+                                start = -1
+
+                    for blob in json_candidates:
+                        if '"answers"' not in blob and '"answer' not in blob:
+                            continue
+                        try:
+                            obj = json.loads(blob)
+                        except json.JSONDecodeError:
+                            # Try fixing common issues: missing closing brace
+                            try:
+                                obj = json.loads(blob + '}')
+                            except json.JSONDecodeError:
+                                continue
+
+                        # Navigate to answers: obj.arguments.answers or obj.answers
+                        ans_obj = None
+                        if isinstance(obj, dict):
+                            if "arguments" in obj:
+                                args = obj["arguments"]
+                                if isinstance(args, str):
+                                    try:
+                                        args = json.loads(args)
+                                    except json.JSONDecodeError:
+                                        args = {}
+                                if isinstance(args, dict):
+                                    ans_obj = args.get("answers")
+                            elif "answers" in obj:
+                                ans_obj = obj["answers"]
+
+                        if ans_obj is not None:
+                            if isinstance(ans_obj, dict):
+                                # {"answer1": "...", "answer2": "..."} → ordered list
+                                keys = sorted(ans_obj.keys())
+                                recovered_answers = [str(ans_obj[k]).strip() for k in keys]
+                            elif isinstance(ans_obj, list):
+                                recovered_answers = [str(a).strip() for a in ans_obj]
+                            else:
+                                recovered_answers = [str(ans_obj).strip()]
+                            break
+
+            # Compare recovered answers with expected
+            # NOTE: liveweb-arena uses LLM-based validation (not exact match).
+            # The LLM validator is flexible with format differences.
+            # Our matching here is still conservative but aligned closer to real scoring:
+            # 1. case-insensitive exact match
+            # 2. numeric within 5% (LLM validator accepts format differences)
+            # 3. substring containment (expected in actual or vice versa, min 3 chars)
+            match_count = 0
+            if recovered_answers and t.answer_details:
+                for idx, detail in enumerate(t.answer_details):
+                    if not isinstance(detail, dict):
+                        continue
+                    expected = str(detail.get("expected", "")).strip().lower()
+                    if idx < len(recovered_answers):
+                        actual = recovered_answers[idx].strip().lower()
+                        if expected and actual:
+                            # Match 1: exact (case-insensitive)
+                            if actual == expected:
+                                match_count += 1
+                                continue
+                            # Match 2: normalize whitespace/punctuation
+                            a_norm = re.sub(r'[\s,_\-]+', ' ', actual).strip()
+                            e_norm = re.sub(r'[\s,_\-]+', ' ', expected).strip()
+                            if a_norm == e_norm:
+                                match_count += 1
+                                continue
+                            # Match 3: numeric within 5%
+                            matched = False
+                            try:
+                                a_num = float(re.sub(r'[$%,\s]', '', actual))
+                                e_num = float(re.sub(r'[$%,\s]', '', expected))
+                                if e_num != 0 and abs(a_num - e_num) / abs(e_num) < 0.05:
+                                    matched = True
+                            except (ValueError, TypeError):
+                                pass
+                            # Match 4: substring containment (min 3 chars)
+                            if not matched and len(expected) >= 3:
+                                if expected in actual or actual in expected:
+                                    matched = True
+                            if matched:
+                                match_count += 1
+
+            parse_failed_recovery.append((t, mode, recovered_answers, match_count, t.num_subtasks))
             flagged.append((t, "PARSE_FAILED",
-                            f"failure_reason={t.failure_reason}, score={t.score:.2f}, "
-                            f"steps={t.total_steps} — agent output could not be parsed"))
+                            f"score={t.score:.2f}, steps={t.total_steps}, "
+                            f"mode={mode} — agent wrote stop in content text, not tool_calls"))
 
     # Flag A: Score > 0 with 0 total steps (zero browser interaction)
     for t in parsed:
@@ -2333,9 +2550,57 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
                 if not ft_sites:
                     ft_sites["unknown"] = len(ft_tasks)
 
-                p(f"  [{ft_name}] {len(ft_tasks)} tasks (all score=0):")
+                label = "AGENT FORMAT ERROR" if ft_name == "PARSE_FAILED" else ft_name
+                p(f"  [{label}] {len(ft_tasks)} tasks (all score=0):")
                 avg_steps = _safe_mean([t.total_steps for t in ft_tasks])
                 p(f"    Avg steps: {avg_steps:.0f} | By site: {', '.join(f'{s}({c})' for s, c in ft_sites.most_common(5))}")
+
+                # For PARSE_FAILED, show format mode breakdown
+                if ft_name == "PARSE_FAILED":
+                    modes = Counter()
+                    for t in ft_tasks:
+                        for _, flags_list in [(t2, fl) for t2, fl in sorted_tasks if t2.task_id == t.task_id]:
+                            for ft2, reason in flags_list:
+                                if ft2 == "PARSE_FAILED" and "mode=" in reason:
+                                    mode = reason.split("mode=")[1].split(" ")[0].rstrip(",")
+                                    modes[mode] += 1
+                    if modes:
+                        mode_str = ", ".join(f"{m}({c})" for m, c in modes.most_common())
+                        p(f"    Format modes: {mode_str}")
+                        p(f"    Root cause: agent writes stop action in content text instead of tool_calls array")
+
+                    # Answer recovery analysis: how many have correct answers in wrong format?
+                    if parse_failed_recovery:
+                        recoverable = [(t, mode, ans, mc, ns)
+                                       for t, mode, ans, mc, ns in parse_failed_recovery
+                                       if ans and mc > 0]
+                        extractable = [(t, mode, ans, mc, ns)
+                                       for t, mode, ans, mc, ns in parse_failed_recovery
+                                       if ans]  # could extract answers, regardless of correctness
+                        total_pf = len(parse_failed_recovery)
+                        p(f"    Answer recovery analysis ({total_pf} tasks):")
+                        p(f"      JSON extractable: {len(extractable)}/{total_pf}"
+                          f" (answers could be parsed from content text)")
+                        if recoverable:
+                            total_matched = sum(mc for _, _, _, mc, _ in recoverable)
+                            total_subs = sum(ns for _, _, _, _, ns in recoverable)
+                            p(f"      Correct answers found: {len(recoverable)} tasks, "
+                              f"{total_matched}/{total_subs} subtasks match expected")
+                            p(f"      -> Would score >0 with env fallback (conservative estimate; env uses LLM validator)")
+                            # Show recoverable task IDs
+                            rec_ids = sorted(t.task_id for t, _, _, _, _ in recoverable)
+                            rec_str = ", ".join(str(i) for i in rec_ids[:8])
+                            if len(rec_ids) > 8:
+                                rec_str += f", ... (+{len(rec_ids) - 8} more)"
+                            p(f"      Recoverable task IDs: {rec_str}")
+                        else:
+                            p(f"      Correct answers found: 0 — all extracted answers differ from expected")
+                        # Tasks where answers couldn't even be extracted
+                        no_extract = total_pf - len(extractable)
+                        if no_extract:
+                            p(f"      Not extractable: {no_extract}/{total_pf}"
+                              f" (plain_text or malformed — no JSON to parse)")
+                    p(f"    Fix: SFT on function-calling format OR env fallback parse content JSON")
                 # Show task IDs compactly
                 ids = sorted(t.task_id for t in ft_tasks)
                 id_str = ", ".join(str(i) for i in ids[:10])
@@ -2349,18 +2614,14 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
         agent_tasks = set()
         for t, flags in sorted_tasks:
             for ft, _ in flags:
-                if ft in ("ZERO_INTERACTION", "UNVISITED_CORRECT", "EMPTY_TASK", "PARSE_FAILED"):
+                if ft in ("ZERO_INTERACTION", "UNVISITED_CORRECT", "EMPTY_TASK"):
                     env_tasks.add(t.task_id)
-                if ft in ("VM_LOOP", "ZERO_COVERAGE"):
+                if ft in ("VM_LOOP", "ZERO_COVERAGE", "PARSE_FAILED"):
                     agent_tasks.add(t.task_id)
 
         p("  FORENSIC VERDICT:")
         if env_tasks:
             # Break down environment concern by type
-            parse_cnt = sum(1 for tid in env_tasks
-                           for t, flags in sorted_tasks
-                           if t.task_id == tid
-                           for ft, _ in flags if ft == "PARSE_FAILED")
             empty_cnt = sum(1 for tid in env_tasks
                            for t, flags in sorted_tasks
                            if t.task_id == tid
@@ -2370,8 +2631,6 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
                                 if t.task_id == tid
                                 for ft, _ in flags if ft in ("ZERO_INTERACTION", "UNVISITED_CORRECT"))
             parts = []
-            if parse_cnt:
-                parts.append(f"{parse_cnt} parse failures (agent output not parseable)")
             if empty_cnt:
                 parts.append(f"{empty_cnt} empty tasks (no subtasks generated)")
             if knowledge_cnt:
@@ -2380,8 +2639,23 @@ def generate_report(miner_info, raw_trajectories, verbose=False):
             for part in parts:
                 p(f"      - {part}")
         if agent_tasks:
-            p(f"    Agent behavior concern: {len(agent_tasks)} unique tasks show pathological"
-              f" patterns (infinite loops, zero coverage despite navigation)")
+            # Break down agent concern by type
+            parse_cnt = sum(1 for tid in agent_tasks
+                           for t, flags in sorted_tasks
+                           if t.task_id == tid
+                           for ft, _ in flags if ft == "PARSE_FAILED")
+            loop_cnt = sum(1 for tid in agent_tasks
+                          for t, flags in sorted_tasks
+                          if t.task_id == tid
+                          for ft, _ in flags if ft in ("VM_LOOP", "ZERO_COVERAGE"))
+            parts = []
+            if parse_cnt:
+                parts.append(f"{parse_cnt} format failures (stop action in content text, not tool_calls)")
+            if loop_cnt:
+                parts.append(f"{loop_cnt} pathological navigation (infinite loops, zero coverage)")
+            p(f"    Agent behavior concern: {len(agent_tasks)} unique tasks")
+            for part in parts:
+                p(f"      - {part}")
         p("")
     else:
         p("  No suspicious trajectories detected.")
@@ -2446,8 +2720,8 @@ def generate_comparison_report(uid_data):
 
     # Overview
     p("  OVERVIEW:")
-    p(f"  {'UID':>6} {'Count':>6} {'Avg':>6} {'Perfect%':>8} {'Zero%':>7} {'Multi%':>7} {'Loops%':>7} {'Coverage':>8}")
-    p("  " + chr(9472) * 70)
+    p(f"  {'UID':>6} {'Count':>6} {'Avg':>6} {'Perfect%':>8} {'Zero%':>7} {'AdjZero%':>9} {'Multi%':>7} {'Coverage':>8}")
+    p("  " + chr(9472) * 76)
     for uid in uids:
         ps = uid_parsed[uid]
         if not ps:
@@ -2458,9 +2732,16 @@ def generate_comparison_report(uid_data):
         perf = sum(1 for t in ps if t.is_perfect) / nn * 100
         zero = sum(1 for t in ps if t.is_zero) / nn * 100
         multi = sum(1 for t in ps if t.is_multi_site) / nn * 100
-        loops = sum(1 for t in ps if t.has_loops) / nn * 100
         cov = _safe_mean([t.site_coverage for t in ps])
-        p(f"  {uid:>6} {nn:>6} {avg:>6.3f} {perf:>7.1f}% {zero:>6.1f}% {multi:>6.0f}% {loops:>6.0f}% {cov:>7.0%}")
+        # Adjusted zero: exclude only empty tasks (true env issues)
+        # parse_failed is agent format error, NOT excluded
+        env_only = sum(1 for t in ps if t.num_subtasks == 0)
+        adj_n = nn - env_only
+        adj_zero = sum(1 for t in ps if t.is_zero) - sum(
+            1 for t in ps if t.is_zero and t.num_subtasks == 0)
+        adj_zero_pct = adj_zero / adj_n * 100 if adj_n > 0 else 0
+        p(f"  {uid:>6} {nn:>6} {avg:>6.3f} {perf:>7.1f}% {zero:>6.1f}% {adj_zero_pct:>8.1f}% {multi:>6.0f}% {cov:>7.0%}")
+    p("  (AdjZero% excludes empty tasks only; parse_failed is agent error)")
     p("")
 
     # Per-website accuracy comparison
@@ -2527,13 +2808,17 @@ def generate_comparison_report(uid_data):
 
     metrics = [
         ("Avg steps/task", lambda ps: _safe_mean([t.total_steps for t in ps])),
+        ("Avg browser_steps", lambda ps: _safe_mean([t.browser_steps for t in ps])),
         ("Avg goto/task", lambda ps: _safe_mean([t.action_counts.get("goto", 0) for t in ps])),
         ("Avg click/task", lambda ps: _safe_mean([t.action_counts.get("click", 0) for t in ps])),
+        ("Avg click_role/task", lambda ps: _safe_mean([t.action_counts.get("click_role", 0) for t in ps])),
+        ("Avg type/task", lambda ps: _safe_mean([t.action_counts.get("type", 0) for t in ps])),
         ("Avg view_more/task", lambda ps: _safe_mean([t.view_more_count for t in ps])),
         ("URL diversity", lambda ps: _safe_mean([t.url_diversity for t in ps if t.goto_urls])),
         ("Site coverage", lambda ps: _safe_mean([t.site_coverage for t in ps])),
-        ("Loop rate", lambda ps: sum(1 for t in ps if t.has_loops) / len(ps) * 100 if ps else 0),
+        ("Loop rate%", lambda ps: sum(1 for t in ps if t.has_loops) / len(ps) * 100 if ps else 0),
         ("Budget exhausted%", lambda ps: sum(1 for t in ps if t.step_budget_exhausted) / len(ps) * 100 if ps else 0),
+        ("Parse failed%", lambda ps: sum(1 for t in ps if t.failure_reason and "parse" in str(t.failure_reason).lower()) / len(ps) * 100 if ps else 0),
     ]
 
     for name, fn in metrics:

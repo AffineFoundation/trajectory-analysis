@@ -18,7 +18,7 @@ navworld 轨迹分析引擎迭代
 5. 如果有任何 失败/成功的 pattern 深入分析
 6. 最开始给我 top findings 要求根据我分析报告背后的意图给出最优价值的 top findings
 7. 环境相关代码的提升点 理解环境背后设计意图 要求多角度充分论证，不得给出不扎实的意见
-8. 由于 USER_DAILY_QUERY_OVER_LIMIT 访问失败导致的task/ 或者类似对端原因导致 api 访问失败的 task ids 要给出并且在 top findings
+8. 特别关注：请重点统计筛查出现 USER_DAILY_QUERY_OVER_LIMIT  或者 No POI data available 访问失败导致的task ids 要给出并且在 top findings
 
 
 每次迭代工作流
@@ -1004,6 +1004,606 @@ Good+ trades around_search (-0.6) → search_flights (+0.6) + search_train_ticke
 
 **不足**: task 898669235 (24K chars, score 0) 的 HC failure 是 format_valid + poi_names_verified。24K 字符的输出如何 format_valid 失败? 可能原因: (1) 输出结构不符合要求的旅行方案格式 (2) 内容过长且混乱。需 deep dump 确认, 但作为监测迭代不深入。
 
+### 迭代 69 (2026-03-19) — 对抗性审查: 报告通过, 无改动 ✅
+- [x] UID 71 recent 10 全文逐行审读 (417 行): 无分析缺陷
+  - avg=27.5, MODERATE, 0% think-only, POI err 10%, around_search 4% err
+  - F2 diversity r=0.634 (正确, post-fix diversity 仍有区分力)
+  - A2: around_search +50pp (4% err, 推荐合理)
+  - 开局 gap 未触发 (poi×3 avg=23.8 vs transport-first avg=30.2, 差距 6.4 < 10 阈值) — 正确
+  - 编造 r=0.503 (n=10) 正确标注 ⚠ small sample
+- [x] 无 affinetes 变更, 无脚本修改需求
+
+**项目收敛状态**: 脚本 2696 行, 69 轮迭代 (42-69 本 session), 全部 8 项目标覆盖, 跨 8+ 矿工 × 2 数据模式验证。剩余唯一环境问题: Q12 think-block (P0, 待修复)。
+
+### 迭代 70 (2026-03-22) — error-score 混淆因子检测 + UNDER-CALLED 虚假信号消除 ✅
+- [x] 跑 UID 162 recent 10: avg=22.8, WEAK, 30% good+, 30% poor, POI err 11% (健康)
+- [x] 发现 Section 8.1 报告 r=+0.441 (error ↔ score 正相关) 但未解释混淆因子
+  - 原因: total_calls ↔ score r=0.464 — 更多调用→更多工具多样性→部分出错→更高分
+  - 误导: "with errors avg=27.4 > without errors avg=15.9" 暗示出错有利
+- [x] 修复 Section 8.1: 当 error-score r>0.15 时检测 total_calls 混淆因子
+  - r_calls>0.2: "⚠ Confound: total_calls ↔ score r=X — more extensive tool usage produces both more errors and higher scores (error rate is not causal)"
+  - r_calls<=0.2: "Note: positive error-score correlation may reflect task complexity or type mix"
+- [x] 发现 UNDER-CALLED 信号 poi_search (Good+ 9.0 vs Poor 6.3) 是假信号
+  - Good+ poi_search share: 63% (9.0/14.3) vs Poor: 70% (6.3/9.0) — Good+ 实际分配更少比例
+  - 绝对差异由 Good+ 总调用更多 (14.3 vs 9.0) 驱动, 非 poi_search 特异性
+- [x] 修复 UNDER-CALLED 信号: 新增 share 混淆检测
+  - 当 Good+ share <= Poor share + 5pp 且 Good+ total_calls > Poor * 1.3 时, 标记 "(volume)" 而非 UNDER-CALLED
+  - poi_search: "UNDER-CALLED" → "(volume)" — 正确抑制; 从 Allocation insight 中移除
+  - around_search/direction: 保持 UNDER-CALLED (share 确实更高)
+- [x] 回归验证:
+  - UID 71: r=0.243, total_calls 相近 → "Note: may reflect task complexity" (正确)
+  - UID 60: r=-0.403 (负相关) → 无混淆注释 (正确); poi_search UNDER-CALLED 保留 (share 37% vs 24%, 确实更高)
+  - UID 162 full report 401 行, 无错误
+
+**不足**: "(volume)" 标签对读者来说可能不够直观。可以改为 "(total calls confound)" 或添加简短解释行。但当前标签足以提示读者这不是真正的 UNDER-CALLED 信号, 且 Allocation insight 中正确排除了该工具。此外, 当前仅在 UNDER-CALLED 方向检测 share 混淆, OVER-CALLED 方向未检测 (当 Good+ total_calls << Poor 时, Poor 的高频可能也是 volume 效应)。但实践中 Good+ 通常有更多或相近的 total_calls, 因此 OVER-CALLED 方向的 volume 混淆罕见。
+
+### 迭代 71 (2026-03-22) — Ghost-excluded 一致性修复 + UID 60 监测 ✅
+- [x] 跑 UID 60 recent 10: avg=24.4, WEAK, 20% good+, 30% poor, improving (+14), POI err 22%
+- [x] 发现 F8 BUDGET SATURATION reallocation 使用 `good_tasks` (含 ghost) 而非 `s3_good`
+  - 与 Section 3/A2/A3 的 ghost-excluded 基准不一致
+  - 当 Good+ 中有 ghost high-scorers 时, reallocation 数据会被 think 块的工具模式污染
+- [x] 修复 F8 reallocation: `good_tasks` → `s3_good`
+- [x] 发现 BUDGET SINK 检测同样使用 `good_tasks`, 修复为 `s3_good`
+- [x] 回归验证: UID 60/162/71 全部通过 (413/401/374 行), 无显示异常
+  - UID 60: F8 reallocation 输出不变 (0 ghost, s3_good = good_tasks)
+  - UID 162/71: 无 BUDGET SATURATION 触发 (正确)
+- [x] affinetes 无新 QQR 变更 (最新 c9c72b3)
+- [x] 数据可用性: UID 78/142/228/30/15 全部返回 "No trajectories" — 仅 UID 60/71/162 有数据
+
+**UID 60 分析要点**:
+- 90% BUDGET SATURATION (9/10 tasks hit 15 calls), 90% 有重复调用 (主要 direction)
+- direction 53 calls = 37% of total, Good+ 4.5 ≈ Poor 5.3 — 非差异化工具
+- around_search OVER-CALLED (Poor 3.7 vs Good+ 2.5) + 23% err
+- Code/LLM coupling r=0.941 (最强), LLM 是全面瓶颈 (18% utilized)
+- 1 suspicious underscore: task 414581353 (business, all HC pass, 6 tools, llm=2.5/50=5%)
+- Step 3 most predictive (r=-0.696, n=10) — 负相关, 早期 POI 失败后恢复的模型得分更高
+
+**不足**: 多数矿工 (78/142/228/30/15) 当前返回零轨迹, 监测范围缩窄至 3 个矿工。原因待查: 可能是采样列表更新、数据库迁移或矿工下线。如果持续, 需要发现新活跃矿工 UID 扩大监测覆盖。
+
+### 迭代 72 (2026-03-22) — BUDGET SATURATION 天花板检测 bug 修复 ✅
+- [x] 跑 UID 71 recent 10: avg=20.6, WEAK, 20% good+, 30% poor, declining (-7), 100% HC pass
+- [x] 发现 BUDGET SATURATION 使用 `max(total_calls)` 而非固定天花板 15 作为参考
+  - UID 71 有 2 个异常任务 (25 calls, 21 calls) 超过 MAX_TOOL_STEPS=15
+  - `max(total_calls)=25` → `at_max = tasks >= 25` = 1 (10%) → 未触发
+  - 实际: 8/10 tasks 有 ≥15 calls, 80% 饱和 → 应当触发
+  - **Bug 原因**: env 允许的步数上限是 15, 但部分任务 tool_trace 记录了超过 15 次调用 (可能是单步内并行调用或 env config 变更)
+- [x] 修复: 使用固定 `ENV_TOOL_CEILING = 15` 替代 `max(total_calls)` 作为饱和参考
+  - `at_ceil = tasks >= 15` = 8 (80%) → 正确触发
+  - 当存在超限任务时显示 `15+ (max 25)` 标签, 否则显示 `15`
+- [x] 回归验证:
+  - UID 71: findings 3→**4** (新增 F4 BUDGET SATURATION: 8/10 80%, 80% repetitive poi_search)
+  - UID 60: F8 不变 (9/10 90%, 全部恰好 15 calls, 显示 "15" 无 +)
+  - UID 162: 不触发 (正确, tasks 不集中在 15)
+  - 报告行数: 71=378(+4), 60=413(不变), 162=401(不变)
+- [x] affinetes 无新 QQR 变更
+
+**UID 71 分析要点**:
+- 100% HC pass (10/10) — 跨矿工最干净的 HC 表现
+- 0% think-only, 0% synth-fail — 每个任务都产出用户方案
+- Tool diversity r=-0.144 (负相关!) — 这个矿工中更多工具多样性不帮助得分
+- F3 CODE/LLM BALANCE: **10/10 code-dominated, 0 balanced** — LLM 是极端瓶颈 (13% vs 30%)
+- SFT Action Plan 仅 1 条 (A1: LLM 提升) — 其他维度无显著信号
+- direction 66 calls = 41% of total, 但 Good+ vs Poor 相同 (5.0 vs 5.0) — 非差异化
+- 2 suspicious underscorers: task 877933026 (food_tour, all pass, llm=5.6/50) + task 482213507 (business, all pass, llm=2.6/50) — LLM 是唯一瓶颈
+
+**不足**: 超限任务 (25 calls, 21 calls) 的成因未确认。可能是: (1) 单步内并行工具调用被展平到 tool_trace (2) env MAX_TOOL_STEPS 在某些时期 >15 (3) 旧数据 env config 不同。需要 deep dump 确认, 但不影响分析正确性 (饱和检测现在使用固定天花板)。
+
+### 迭代 73 (2026-03-22) — 新矿工扫描 + 双峰分布检测 ✅
+- [x] 扫描 22 个新 UID (45-220 步进): 发现 5 个新活跃矿工 (45, 75, 90, 100, 150)
+  - 此前仅 3 个矿工有数据 (60, 71, 162), 现在扩展到 **8 个**
+- [x] 跑 UID 90 recent 10: avg=27.2, MODERATE, **50% good+ / 0% acceptable / 50% poor**
+  - **双峰分布**: 分数要么 30-51 (good+) 要么 9-14 (poor), 15-30 区间零任务
+  - avg=27.2 具有误导性 — 没有任何任务实际得分接近 27
+- [x] 发现 Executive Summary 不检测双峰分布, avg 对读者有误导
+- [x] 新增双峰检测: 当 acceptable=0 且 good+ > 0 且 poor > 0 时触发
+  - "⚠ Bimodal: 0% acceptable — tasks either succeed (≥30) or fail (<15), avg 27 is misleading"
+- [x] 回归验证: UID 71/60/162/45 均不触发 (有 acceptable tasks); UID 100 不触发 (0% good+)
+
+**UID 90 分析要点 (MODERATE, bimodal)**:
+- 100% BUDGET SATURATION, 70% 重复调用 (direction 主导)
+- **Good+ vs Poor 工具模式完全相同**: unique 4.8=4.8, total 15=15, err 16%≈17%, 所有 adoption gap=0pp
+- 唯一差异是 LLM 输出质量 → SFT 应纯粹聚焦 output content, 工具策略已最优
+- 4 suspicious underscorers: all HC pass, 3000+ chars, LLM 4.9-5.8/50 → LLM judge 是二分器
+- direction 19.4% err (异常高, 通常 0-5%) — 可能是坐标传参问题
+- BUDGET SINK: poi_search 33%, r=0.122 (非差异化)
+- Reasoning connectors r=0.426 (⚠ 潜在 reasoning keyword hack 信号, 但 n=10 需谨慎)
+- 快速检查 UID 100: avg=0.0, 60% think-only, 6 env-invalidated, 6 zero-tool — 极弱矿工
+- 快速检查 UID 45: avg=21.3, WEAK, 23% POI err, improving (+17)
+
+**不足**: 双峰检测仅基于 tier 分类 (acceptable=15-30)。如果分数分布在某个不同阈值处分裂 (如 20-35 无任务但 acceptable 非零), 检测不会触发。更精确的方式是计算分数分布的 Hartigan's dip test 或简单的 gap detection (连续空桶), 但这增加了复杂度且当前 tier-based 方法已覆盖最常见的双峰模式。
+
+### 迭代 74 (2026-03-22) — Section 8.1 小样本警告 + UID 45 验证 ✅
+- [x] 跑 UID 45 recent 10: avg=28.2, MODERATE, improving (+16), 30% think-only, 1 ghost (42.5)
+- [x] 发现 Section 8.1 "With errors vs Without errors" 对比当一组 n<3 时不可靠但无警告
+  - UID 45: n=8 vs n=2, UID 60: n=8 vs n=2 — 常见场景 (多数任务有某些错误)
+  - r=0.045 (近零) 但 "with errors avg=31.2 > without errors avg=16.5" 差距大 — 误导性
+- [x] 修复: 当 min(n_has_err, n_no_err) < 3 时追加 "(⚠ one group has n<3 — comparison unreliable)"
+- [x] 回归验证: UID 45 + UID 60 (n=2 触发), UID 71 (n=4+6 不触发)
+- [x] UID 45 报告全面检查:
+  - F2 THINK-ONLY 30% + 1 ghost → P0 SCORER 推荐正确触发
+  - OPENING STRATEGY GAP +19 pts → A1 正确集成
+  - poi_search OVER-CALLED (8.7→5.8) → A3 正确
+  - 10.1 single_poi consensus 100% → 正确排除 ghost
+  - 5 action items 全部合理, 优先级正确
+
+**UID 45 分析要点 (MODERATE, improving +16)**:
+- API 恢复检测: POI err 33%→6%, score 15.3→31.7
+- 1 ghost: task 314249560 (multiday, 42.5, 0 user chars, code=28.1, llm=16.7, HC PASS)
+- Winning opening: `poi_search → weather → around_search` avg=37.4 (+19 pts vs poi_search×3)
+- poi_search OVER-CALLED + around_search UNDER-CALLED — 典型的 "早期多样化" 信号
+- direction 19.2% err (异常高, 与 UID 90 一致) — 可能是共享 API 限制
+- 1 suspicious underscore: task 783648499 (business, all pass, llm=1.1/50=2%)
+
+**不足**: Section 8.1 "With errors vs Without errors" 二分法不如连续 r 值可靠。当 r≈0 但二分对比差距大 (31.2 vs 16.5) 时, 读者可能被二分数据误导而忽略 r 值。考虑当 |r|<0.1 且组间差距>10 时显式提醒 "r near zero: binary comparison misleading"。但当前的 n<3 警告已覆盖最常见的误导场景。
+
+### 迭代 75 (2026-03-22) — ⚠️ F2 TOOL DIVERSITY 方向性 bug 修复 ✅
+- [x] 跑 UID 75 recent 10: avg=22.3, WEAK, declining (-9), 20% think-only
+- [x] **发现 F2 方向性 bug**: `abs(r_tools_score) > 0.2` 允许负相关触发 "diversity helps" 结论
+  - UID 75: r=-0.209, Good+ 4.7 < Poor 4.8 (gap -0.1) — 更多工具实际关联更低分
+  - 但 F2 输出: "TOOL DIVERSITY is the strongest score predictor" + "Using 4+ different tool types is strongly associated with higher scores"
+  - **完全错误的分析结论** — abs() 掩盖了相关方向
+- [x] 修复: `abs(r_tools_score) > 0.2` → `r_tools_score > 0.2` (仅正相关时触发 diversity 发现)
+  - 同时修复 EFFICIENCY 分支条件: `abs(r_tools_score) <= 0.2` → `r_tools_score <= 0.2`
+- [x] 回归验证 (6 矿工):
+  - UID 75 (r=-0.209): F2 **不再触发** (修复前: 错误触发), findings 6→5
+  - UID 162 (r=+0.475): F2 **正确触发** (正相关, 不受影响)
+  - UID 71 (r=-0.144): 不触发 (正确, 弱负相关)
+  - UID 60 (r=+0.121): 不触发 (正确, 弱正相关 < 0.2)
+  - UID 90 (r=+0.223): 触发 (正确, 正相关 > 0.2)
+  - UID 45: 不触发 (正确)
+- [x] 跑 UID 150 (all 0, env-invalidated): 极弱矿工, 不适合分析
+
+**影响评估**: 这个 bug 自迭代 26 (F2 引入) 以来存在, 影响所有 r_tools_score < -0.2 的矿工报告。在过往迭代中, 多数矿工 r_tools_score 为正 (0.3-0.7), 因此实际被误导的情况有限。但 UID 71 在 iter 35 中 r=0.083 且被正确跳过 (因为 EFFICIENCY 分支优先), 说明 bug 仅在特定条件下暴露。UID 75 是首次暴露此 bug 的矿工。
+
+**不足**: F2 在 r 刚过 0.2 但 Good+ vs Poor gap ≈ 0 时 (如 r=0.223, gap=0.0) 的 practical advice 可能误导。考虑要求 r > 0.2 AND gap > 0.5 双重条件, 但这可能在小样本中过度过滤。当前阈值可接受。
+
+### 迭代 76 (2026-03-22) — 对抗性审查: UID 75 通过 + multi-compare 验证 ✅
+- [x] UID 75 recent 10 完整报告 (post-fix) 逐行审读: **无分析缺陷**
+  - avg=22.3, WEAK, declining (-9), 20% think-only, 0 ghost
+  - F2 fix 确认: r=-0.209 不再触发 TOOL DIVERSITY (iter 75 修复生效)
+  - Section 8.1: n=1 "Without errors" → "⚠ one group has n<3" 正确 (iter 74 修复生效)
+  - poi_search OVER-CALLED 6.2→2.3 + "(8% err — calls may be justified)" 交叉引用正确
+  - around_search 50% err → P1 正确标记; A3 会正确跳过 (>50% 过滤)
+  - Reasoning r=0.562 (跨矿工最高) — 正确标记 ⚠ hack warning
+  - 5 findings, 4 actions, 全部合理
+- [x] --multi-compare 60,71,162 验证通过 (200+89+182 tasks):
+  - 跨矿工 avg: 20.0 / 20.1 / 21.8 — 非常接近
+  - POI failure consistency: r=0.128~0.352 (post-fix, 远低于 pre-fix r=0.85-0.90)
+  - 时序趋势: UID 71 declining (-4.2), UID 60/162 improving (+0.7/+3.4)
+  - API fallback: 404 (case mismatch "navworld" vs "NAVWORLD") → DB fallback正常
+- [x] 无 affinetes QQR 新变更, 无脚本修改需求
+
+**项目状态**: 脚本 ~2710 行, 76 轮迭代, 全部 8 项目标覆盖。近 5 轮迭代 (70-75) 修复了 4 个分析准确性 bug (error-score 混淆因子, UNDER-CALLED volume confound, BUDGET SATURATION ceiling, F2 方向性) + 3 个显示增强 (ghost-excluded 一致性, 双峰检测, 小样本警告)。当前脚本在 8 个活跃矿工上验证通过, 无已知分析缺陷。
+
+### 迭代 77 (2026-03-22) — OVER-CALLED 优先级按幅度分级 + UID 90 深度验证 ✅
+- [x] 跑 UID 90 --all --recent 20: avg=29.0, MODERATE, 50% good+, 95% HC pass, 0% think-only
+  - 20 tasks 解决了 n=10 时的双峰伪影 (acceptable 从 0% 升至 20%)
+  - 10.1 新增 2 个类型特异序列: business (75% consensus, avg=47.8) + family_study (100%, avg=38.2)
+  - A1 OPENING GAP +23 pts: `poi_search→poi_search→search_flights` vs `weather→poi_search→poi_search`
+- [x] --deep 459894760 (56.0, hybrid, 最高分) 验证通过
+  - SR 模式: 0.92→1.00 (transport) →0.64 (POI decay) →0.92 (around_search recovery)
+  - Q13 重现: weather("西安") 返回黑龙江西安区 (非陕西西安)
+  - 输出结构化: 交通对比表 + 按日行程 + 真实 flight/train ID
+- [x] 发现 OVER-CALLED action 优先级 [HIGH] 不区分幅度
+  - UID 90: direction (6→5) delta=1 → [HIGH] (不合理, 仅 1 call 减少)
+  - UID 45: poi_search (7→4) delta=3 → [HIGH] (合理, 显著减少)
+  - UID 75: poi_search (8→3) delta=5 → [HIGH] (合理, 大幅减少)
+- [x] 修复: 当 max_delta > 2 时 [HIGH], 否则 [MED]
+  - UID 90: direction (7→5) 修正为 **[MED]** (delta≈2, 边界值)
+  - UID 45/75: 保持 [HIGH] (delta 3+5, 显著)
+
+**不足**: 当前 OVER-CALLED 阈值 `pf - gf > 1.0` 在边界值 (delta≈1.01) 时触发过于敏感。direction 6.2→5.2 的 1 call 减少在实践中可能没有意义。考虑提高到 `> 1.5` 但这可能导致一些真实信号被遗漏 (如 poi_search 5→3 的 delta=2, 在 > 1.5 下仍触发)。当前阈值配合 [MED] 优先级已足够区分重要性。
+
+### 迭代 78 (2026-03-22) — Suspicious Underscore 主要阻塞因子精确诊断 ✅
+- [x] 跑 UID 45 --all --recent 20: avg=26.1, MODERATE, 35% good+, 85% HC pass
+- [x] 发现 Section 7.2 "Primary blocker" 仅统计 HC failure, 忽略 "all HC pass but LLM terrible" 模式
+  - UID 45: 4 suspicious underscorers, **3/4 all HC pass**, avg LLM=3.6/50 (7%)
+  - 旧输出: "Primary blocker: transport_grounded (1/4)" — 仅反映 1 个 HC 失败, 忽略 3 个 LLM 瓶颈
+  - **误导**: 读者认为 HC 是主要问题, 实际上 75% 的 underscore 是纯 LLM 质量问题
+- [x] 修复: 当 >50% suspicious tasks 通过全部 HC → "Primary blocker: LLM quality (N/M pass all HC, avg LLM=X/50)"
+  - HC failure 降级为 "Also blocked by:" 补充说明
+  - 无 all-pass 多数时保持原逻辑 (HC 是 primary)
+- [x] 回归验证:
+  - UID 45: "Primary blocker: LLM quality (3/4, avg LLM=3.6)" + "Also blocked by: transport_grounded (1/4)" ✓
+  - UID 90: "Primary blocker: LLM quality (5/5, avg LLM=5.6)" (纯 LLM, 无 HC) ✓
+  - UID 162: "Primary blocker: LLM quality (2/2, avg LLM=4.1)" ✓
+  - UID 60: 无 suspicious underscorers → section 不出现 ✓
+
+**UID 45 分析要点 (--all 20 tasks)**:
+- 600 total tasks, 20 analyzed, improving trend for single_poi/family_study
+- 10.1 新增 2 个类型序列: single_poi (100% consensus) + family_study (100% consensus)
+- A1 OPENING GAP +22 pts: `poi_search→weather→poi_search` vs `poi_search→poi_search→weather`
+- 4 suspicious underscorers 中 3 个是 business 类型 — business 特别容易被 LLM judge 低评
+- avg LLM=3.6/50 (7%) 在 all-HC-pass 任务中 — 通过所有格式/工具检查但内容质量极差
+
+**不足**: "Primary blocker: LLM quality" 的诊断是准确的, 但不够具体 — LLM 低分可能是因为: (1) 输出格式差 (无 sections/headers) (2) 推理浅 (无因果分析) (3) 事实错误 (编造数据). 当前无法区分这三种原因, 因为 score_breakdown 只有聚合的 noisy_llm 值而无 5 维细分 (practicality, logic, analysis_depth, user_experience, factual_grounding). 如果未来 score_breakdown 提供维度细分, 可以精确诊断 "LLM 低是因为 X 维度"。
+
+### 迭代 79 (2026-03-22) — Opening gap 频次平局 bug 修复 ✅
+- [x] 跑 UID 75 --all --recent 15: avg=23.9, WEAK, declining (-19), F2 EFFICIENCY (r_total=-0.308)
+- [x] 发现 OPENING STRATEGY GAP 检测在频次平局时依赖 Counter 插入顺序
+  - UID 75: 两个开局 n=2 平局: `transport-first` avg=40 vs `poi→weather→around` avg=11
+  - Counter 恰好把 avg=40 排在前面 → 当作 "most common" → 无更好替代 → **gap 不触发**
+  - 实际存在 29 pts 差距 (40 vs 11), 应当报告
+- [x] 修复: 频次平局时选 avg 最低的作为 "most common" (最大化 gap 检测)
+  - 修复后: "OPENING STRATEGY GAP: poi_search→weather→around_search avg=11 vs transport-first avg=29.6 (+19 pts)"
+  - 非平局时行为不变 (仍选频次最高的)
+- [x] 回归: UID 45/90 已有 gap 的矿工保持不变 (它们的 most_common 频次唯一最高, 无平局)
+
+**项目状态 (迭代 70-79 本 session 总结)**:
+- **6 个分析准确性 bug 修复**: error-score confound, UNDER-CALLED volume, BUDGET SATURATION ceiling, F2 方向性, OVER-CALLED 优先级, Opening gap 平局
+- **4 个分析增强**: ghost-excluded 一致性, 双峰检测, 小样本警告, Suspicious Underscore LLM 诊断
+- **新矿工**: 监测覆盖从 3→8 个活跃矿工
+- 脚本 ~2720 行, 79 轮迭代, 8+ 矿工验证通过
+
+### 迭代 68 (2026-03-19) — Poor 小样本警告 (post-fix 数据适应) ✅
+- [x] 新增 **Poor 小样本警告**: 当 Poor < 3 时显示 "Poor n=N"
+  - Post-fix 后很多矿工 Poor 仅 0-1 个 → Good+ vs Poor 从 Poor 侧也不可靠
+  - UID 142 (n=1 Poor): `⚠ small sample (Good+ n=3, excl. 1 ghost, Poor n=1)` — 双侧警告
+  - UID 71 (n=6 Poor): 无 Poor 警告 — 正确
+  - UID 78 (n=5 Poor): 仅 Good+ 警告 — 正确
+- [x] 跑 UID 142/71/78 验证: 3 矿工全部通过
+
+**对抗性发现**: Post-fix 数据中, 高性能矿工 (UID 142 avg=32, 只有 1 个 Poor task) 的所有 adoption gap / frequency delta 都基于与单个 Poor 任务的对比。此前仅警告 Good+ 小样本, 遗漏了 Poor 侧同样的问题。
+
+### 迭代 67 (2026-03-19) — 监测: recent 3 短期波动, recent 10 仍 MODERATE ✅
+- [x] UID 142 recent 3 = 14.2 (VERY WEAK) — 短期低分窗口 (11-16 range), 含 1 think-only
+- [x] UID 142 recent 10 = **32.0 (MODERATE)** — 确认非回归, 是自然方差
+- [x] POI err 10% — API 仍健康, 非环境问题
+- [x] 无 affinetes 代码变更
+
+**结论**: n=3 窗口对分数波动敏感。脚本 recent 10+ 提供稳定评估。无需修改。
+
+### 迭代 66 (2026-03-19) — 监测: 全矿工 MODERATE 稳定 ✅
+- [x] 跨 5 矿工 recent 5: UID 60=25.3, 71=26.0, 78=32.1, 142=29.6, 162=17.1
+- [x] 4/5 矿工 MODERATE, 1 WEAK (UID 162: LLM 10%, MONO_TOOL 20%)
+- [x] 无代码变更, 无新 affinetes commits, 报告稳定
+- [x] UID 162 滞后原因: poi_search (12→1) OVER-CALLED + around_search/direction 采用不足
+
+**项目状态**: 数据监测模式。脚本 2690 行, 功能完整。等待 Q12 修复。
+
+### 迭代 65 (2026-03-19) — Post-fix 稳定监测: 接近 STRONG ✅
+- [x] 无 affinetes 代码变更, 纯数据监测
+- [x] 跨 3 矿工 recent 8 快照:
+
+| UID | Avg | Label | Good+ | Poor | F2 Signal | Actions | 核心问题 |
+|-----|-----|-------|-------|------|-----------|---------|---------|
+| 142 | **37.8** | MODERATE | 50% | **0%** | Diversity (r=0.27) | **1** (LLM only) | LLM 瓶颈 |
+| 78 | 27.5 | MODERATE | 38% | 62% | Think-only (62%) | 4 | **Q12 think-block** |
+| 71 | 24.0 | WEAK | 38% | 50% | Diversity (r=0.76) | 4 | Tool diversity + LLM |
+
+**关键观察**:
+1. **UID 142 接近 STRONG**: avg=37.8, 0% poor, 唯一 action = 提升 LLM → 模型质量是唯一限制
+2. **UID 78 被 Q12 拖累**: 62% think-only, 2 ghost (74.6+34.2), 如修复 Q12 预计 avg 降至 ~15 但反映真实能力
+3. **API 问题已解决**: 0 矿工触发 RATE LIMITED finding, rate_limit 降至偶发 (0-1 per task)
+4. **脚本 2690 行, 无需修改** — 所有功能正确适应 post-fix 数据
+
+**项目状态**: 功能完整, 数据监测模式。后续关注 Q12 修复部署。
+
+### 迭代 64 (2026-03-19) — Section 9.3 P0 SCORER 推荐 (Q12 think-block) ✅
+- [x] Section 9.3 CONSOLIDATED ENVIRONMENT FIX RECOMMENDATIONS 新增 **P0 SCORER** (条件: ghost_high 存在)
+  - "P0 SCORER: N ghost high-scorers (score≥30 with 0 user content)"
+  - 提供一行修复: `re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)`
+  - 引用: "Other envs (trace, lgc) already strip — QQR scorer does not (Q12)"
+  - 仅在检测到 ghost high-scorers 时显示 — UID 60 (0 ghost) 不触发
+- [x] 跑 UID 78/142/60 验证: ghost 矿工显示 P0, 非 reasoning 矿工不显示
+
+**迭代 64 结果**:
+- UID 78 (2 ghosts): P0 SCORER ✓ — 60% think-only, Q12 是当前最大限制
+- UID 142 (1 ghost): P0 + P1 (cache fix) 同时显示 ✓ — 混合 pre/post-fix 数据
+- UID 60 (0 ghost): 无 P0 ✓ — 非 reasoning model 不受 Q12 影响
+- UID 142 recent 5: avg=**39.3**, 60% good+ — 接近 STRONG, API 问题已解决
+
+**Section 9.3 现在的完整推荐体系**:
+| 优先级 | 推荐 | 触发条件 | 状态 |
+|--------|------|---------|------|
+| P0 | SCORER: strip `<think>` tags | ghost_high > 0 | ⚠ 待修复 |
+| P1 | API cache fix | poi_err > 30% + rate_limit dominant | ✅ 已修复 (9530c56) |
+| P1 | Evaluation invalidation | (env-side, automatic) | ✅ 已修复 (c9c72b3) |
+| P2 | Zero-tool tasks | zero_tool > 0 | 偶发 |
+| P3 | Reward shaping | always | 长期建议 |
+
+### 迭代 63 (2026-03-19) — 环境侧评估无效化检测 (commit c9c72b3) ✅
+- [x] affinetes 新增 commit c9c72b3: 当工具调用命中 API rate limit 时, 评估标记为无效 (score=0, score_breakdown.error 设置)
+  - 检测模式: USER_DAILY_QUERY_OVER_LIMIT, QPS_OVER_LIMIT, tool_call_timeout 等
+  - 意义: **权威信号** — 环境直接标记 "这不是模型的错", 取代我们的启发式检测
+- [x] 脚本新增 `is_env_invalidated` 属性: 解析 `score_breakdown.error` 字段
+  - `is_api_blocked` 升级: env_invalidated 优先, 启发式 (>80% server errors) 作为后备
+  - ALL TASKS 表: `E` = env-invalidated (权威), `A` = api-blocked (启发式)
+  - Executive Summary risks: 显示 "N env-invalidated (rate limit)" 当存在时
+- [x] 向后兼容: 旧数据 (无 error 字段) 仍使用启发式检测, 新数据使用权威信号
+- [x] 跑 UID 142/78/60 验证: 无误报, 旧数据正确使用 A 标记
+
+**迭代 63 结果 (UID 142, recent 15)**:
+- avg=28.0, MODERATE, 33% good+, improving (+29) — post-fix 趋势持续
+- 2 tasks 仍标记 A (pre-fix 数据, 启发式), 0 tasks 标记 E (commit c9c72b3 尚未部署到生产)
+- 部署后预期: 命中 rate limit 的 tasks 将自动得到 score=0 + error 标记 → `E` 标记 → 从模型评估中排除
+
+**新增环境侧保护总结**:
+```
+commit 9530c56: cache 修复 (pickle → JSON) → 减少 API 调用量
+commit c9c72b3: 评估无效化 → 命中 rate limit 的 tasks 不参与评分
+```
+两个修复配合: 减少 rate limit 触发频率 + 触发时不惩罚模型。
+
+### 迭代 62 (2026-03-19) — Post-fix 跨矿工监测 + 稳定性确认 ✅
+- [x] 跨 5 矿工 post-fix recent 10 快照:
+
+| UID | Model type | Avg | Label | Good+ | Trend | POI err |
+|-----|-----------|-----|-------|-------|-------|---------|
+| 60 | 非reasoning | 23.2 | WEAK | 30% | declining (-7) | ~15% |
+| 71 | 混合 | 24.8 | WEAK | 40% | improving (+8) | 9% |
+| 78 | Reasoning | 24.5 | WEAK | 30% | declining (-10) | 17% |
+| 142 | Reasoning | **32.8** | **MODERATE** | 40% | improving (+9) | ~20% |
+| 162 | Reasoning | 18.8 | WEAK | 20% | declining (-17) | ~30% |
+
+- [x] UID 78 (60% think-only): F2 跳过 diversity/efficiency (都不显著), 正确聚焦 think-only (F2 位置)
+- [x] UID 60 (非 reasoning): F6 BUDGET SATURATION (100% hit 15 calls) — post-fix 后此问题更显著
+- [x] 脚本 2675 行, 无需修改, 所有功能正确适应 post-fix 数据
+
+**Post-fix 稳定观察**:
+1. **UID 142 领先**: 唯一 MODERATE 矿工, 40% good+, intercity avg=62.0
+2. **UID 78 被 think-only 拖累**: 60% 输出无用户方案, Q12 漏洞是现在的主要限制
+3. **UID 162 最弱**: declining (-17), POI err 仍偏高 (~30%), 可能数据窗口混入较多 pre-fix 任务
+4. **LLM 是跨矿工统一瓶颈**: 所有 5 矿工 F1 = LLM bottleneck, code/LLM gap 2-3x
+5. **API 已不再是主要限制**: 0 矿工触发 RATE LIMITED finding (recent 10 窗口)
+
+### 迭代 61 (2026-03-19) — F2 信号自动切换: 多样性 → 效率 (post-fix 适应) ✅
+- [x] F2 (TOOL DIVERSITY/EFFICIENCY) 增强: 当 `|r_total_calls|` > `|r_unique_tools|` × 2 且 r_total < -0.3 时, 优先显示 EFFICIENCY
+  - Post-fix (recent 8): r_diversity=0.218, r_efficiency=-0.788 → **TOOL EFFICIENCY** (3.6x 更强)
+  - Pre-fix (recent 30): r_diversity=0.702 → **TOOL DIVERSITY** (仍是主信号)
+  - 原理: API 健康后工具多样性饱和 (avg 4.8 unique), 调用效率成为差异化因素
+- [x] 跑 UID 142 recent 8/30 + UID 71 recent 30 验证
+
+**迭代 61 结果 (UID 142, pure post-fix recent 8)**:
+- avg=**36.6**, **MODERATE**, 50% good+, 25% poor — 接近 STRONG
+- F2: **TOOL EFFICIENCY** (r=-0.788): Good+ 9.2 calls vs Poor 13.0 — fewer targeted calls score higher
+- F3: POI err **21%** (healthy) → P1 API recommendation 不再触发
+- direction OVER-CALLED (6.5 vs 1.8) — post-fix 新问题: Poor 过度使用 direction 而非其他工具
+- 开局 gap +19 pts: transport-first avg=45.5 vs poi_search×3 avg=26.1
+- LLM 是唯一瓶颈: code 50% vs LLM 24% — 2x 差距
+
+**Post-fix 分析范式转变**:
+| 维度 | Pre-fix | Post-fix |
+|------|---------|----------|
+| 主要预测因子 | Tool diversity (r=0.5-0.7) | **Tool efficiency** (r=-0.79) |
+| 瓶颈 | API 环境 | **LLM 模型质量** |
+| OVER-CALLED | poi_search (API 失败重试) | **direction** (预算浪费) |
+| MONO_TOOL | 32-50% (API-blocked) | **0%** |
+| 开局 gap | +15-25 pts (poi 开局=灾难) | +19 pts (poi 开局也可行 avg=26) |
+| P1 recommendation | API cache fix needed | **不触发** |
+
+### 迭代 60 (2026-03-19) — Cache 修复后验证: 跨矿工分数恢复确认 ✅
+- [x] 跨 5 矿工 post-fix recent 10 对比:
+
+| UID | Pre-fix avg | Post-fix avg | 变化 | POI err pre | POI err post |
+|-----|------------|-------------|------|------------|-------------|
+| 60 | 10-12 | **20.6** | +8-10 | 84-92% | ~20% |
+| 71 | 4.9 | **25.9** | +21 | 100% | **9%** |
+| 78 | 18-20 | **24.5** | +5 | 10% | ~17% |
+| 142 | 7-10 | **32.2** | +22 | 82-98% | **26%** |
+| 162 | 8-10 | **18.8** | +9 | 89-91% | ~30% |
+
+- [x] 脚本自动检测到恢复: "✓ API RECOVERY DETECTED: POI failure rate decreasing over time"
+- [x] Performance labels 升级: VERY WEAK → WEAK/MODERATE (跨矿工)
+- [x] 10.1 Optimal Tool Sequence 在 UID 142 post-fix 有数据: intercity 100% consensus transport-first (avg=52.2)
+- [x] 无需脚本修改 — 所有现有功能正确处理恢复期数据
+
+**迭代 60 结果 (UID 142, recent 15, 混合 pre/post-fix)**:
+- avg=24.9, **33% good+**, 40% poor — **WEAK → adj. MODERATE** (excl. 3 API-blocked)
+- Temporal: Q1=16.9 → Q4=**42.4** (+25.4 ↑) — 剧烈改善
+- POI err: Q1=100% → Q4=**14%** (-86pp) — cache 修复生效
+- **5 个 Good+ 任务全部有真实用户方案** (2083-3379 chars, 4-6 unique tools)
+- intercity avg=36.3 (最强), 10.1 显示 `search_flights → search_train_tickets → weather` 100% consensus
+- 3 个 RATE LIMITED 任务明确来自 pre-fix 期 (100% rate_limit)
+- **rate_limit 从分析窗口 98-100% 降至 93.7%** (混合期), 纯 post-fix 数据预计 <20%
+
+**关键验证**:
+1. 脚本的 TEMPORAL TREND 正确检测恢复 (+25 delta, API recovery detected)
+2. adj. score 正确排除 pre-fix 的 API-blocked 任务
+3. MONO_TOOL 在 post-fix 数据中几乎消失 (仅 2/15, 均来自 pre-fix)
+4. LLM 成为真正的瓶颈 (16% vs code 35%) — 模型质量现在是主要限制因素, 而非环境
+
+### 迭代 59 (2026-03-19) — ⚠️ 根因确认: MCP cache 序列化 bug 导致全部 rate_limit ✅
+- [x] **affinetes 新增 2 个 QQR commits** (9530c56 + 5512959, 2026-03-19):
+  - `MCP cache 0% hit rate`: Pydantic v2 的 `pickle.loads()` 静默失败 → 所有 4,336 缓存条目 access_count=0
+  - 结果: 每次 poi_search 调用都直接请求高德 API → ~35,000 daily calls → **USER_DAILY_QUERY_OVER_LIMIT**
+  - 修复: pickle → JSON 序列化 + cache.set try/except + 坐标归一化 + 动态 TTL
+- [x] Section 9.3 P1 API Infrastructure 更新: 当 rate_limit > 50% 时显示根因
+  - "Root cause: MCP cache 0% hit rate (Pydantic v2 pickle serialization bug)"
+  - "Fixed in commit 9530c56: JSON serialization replaces pickle"
+  - "Expected: POI errors should drop significantly after deployment"
+- [x] 跑 UID 142/78 验证: rate-limited 矿工正确显示根因, 健康矿工不触发
+
+**迭代 59 结果 — 根因链完整闭合**:
+
+```
+我们的分析发现链:
+  iter 4-5:  POI API 70% 失败率, 跨矿工 r=0.85-0.90 → 环境端确认
+  iter 10:   时序退化 POI err 13%→98%, 跨矿工一致 → API 恶化
+  iter 54:   87.5% 错误是 USER_DAILY_QUERY_OVER_LIMIT → 高德配额
+
+环境团队的根因:
+  MCP cache pickle.loads() 静默失败 (Pydantic v2 不兼容)
+  → 4,336 缓存条目 0 次命中
+  → 每次调用直接请求 API → 35,000 daily calls
+  → 高德每日配额耗尽 → USER_DAILY_QUERY_OVER_LIMIT
+
+修复: commit 9530c56 (JSON 替代 pickle)
+预期: 部署后 POI 错误率应从 90%+ 降至 <10%
+```
+
+这完整验证了 Goal 7 ("环境相关代码的提升点") 和 Goal 8 ("USER_DAILY_QUERY_OVER_LIMIT task IDs") 的分析价值 — 我们的数据驱动发现最终指向了实际的代码 bug。
+
+### 迭代 58 (2026-03-19) — 综合验证: 稳定性确认 ✅
+- [x] UID 162 --all --recent 40: 871 total, 40 analyzed, 5 Good+ (2 ghost), 20 RATE LIMITED, 全部正确
+- [x] UID 15 --all --recent 40: 低 API 错误 (27%), 仅 1 RATE LIMITED task, 16 tasks 有至少 1 次配额限制
+- [x] 全面检查: F1-F8, Section 1-10, Executive Summary, Error cause, Rate-limited task ID 清单, SFT Action Plan 均正确
+- [x] 确认 affinetes 无代码变更 (最新 718276b 2026-03-11)
+
+**迭代 58 结果 — 报告稳定性确认**:
+
+**UID 162 (--all recent 40)**: avg=10.3, adj. WEAK (19.0 excl. 20 API-blocked). rate_limit 99.5% of errors. Rate-limited avg=9.7 vs non-rate-limited avg=44.5 — API quota 导致 4.6x 分数差距。transport-first 开局 +24 pts 差距。
+
+**UID 15 (--all recent 40)**: avg=8.0, declining (-16). 仅 27% err, 1 RATE LIMITED. 但 16/40 tasks 至少有 1 次配额限制 — 即使低 err 矿工也受影响。无 OPENING STRATEGY GAP (最常用开局已是最优)。3 action items, 无 A2 OVER-CALLED (poi_search 未被过度调用)。
+
+**稳定性结论**: 脚本 2660 行, 跨 8+ 矿工 (UID 15/30/60/71/78/142/162/228) + 2 种数据模式 (sampling/--all) + 多种窗口大小 (20-50) 验证通过。所有 8 项目标全覆盖, 无已知 bug。
+
+### 迭代 57 (2026-03-19) — A2 rate_limit 百分比修复 + 全面验证 ✅
+- [x] 修复 A2 rate_limit 计数 bug: `rl_count` 统计跨所有工具的 rate_limit 但除以单工具错误数 → 出现 "208/174" (>100%) 不一致
+  - 改为使用聚合错误百分比: "97% of errors are rate_limit"
+  - UID 60: `"Cause: API daily quota (97% of errors are rate_limit)"` — 正确
+  - UID 78: `"Good+ tasks diversify earlier"` — 无 rate_limit cause (正确, 低 err)
+- [x] 跑 UID 60/78 验证通过
+
+**迭代 57 结果 (UID 60, recent 30)**:
+- avg=10.6, 10% good+, 80% poor — VERY WEAK, declining (-16)
+- Error cause: 97.3% rate_limit, 1.8% api_error, 0.9% no_data
+- **30/30 tasks 被 rate_limit 影响** (包括高分任务 75.1 和 57.9)
+- 仅 2 个 POI all-success tasks (avg 49.5) vs 27 个 POI all-fail (avg 6.0) — 8x 差距
+- A1 开局策略: `poi_search → poi_search → weather` avg=30 vs `weather → poi_search → poi_search` avg=3 (+27 pts)
+  - 注意: 最佳开局不是 transport-first 而是 poi-search-first (延迟 weather), 因为 UID 60 的强类型是 business/family_study
+
+**不足**: 报告已全面覆盖所有 8 项目标, 错误分类精确 (rate_limit/no_data/api_error), task ID 清单完整。后续应关注环境代码变更或新矿工数据, 而非继续打磨。
+
+### 迭代 56 (2026-03-19) — 对端限制行为完整记录 + task ID 清单 + F4 bug 修复 ✅
+- [x] **修复 F4 显示 bug**: iter 54 引入 `rate_limit` 分类后, F4 的 per-task 计数仍用旧的 `api_error+timeout` → 显示 `(0/5 api/infra)`。修复为 `rate_limit+api_error+timeout` + 显示主要错误类型
+- [x] **F4 标签升级**: 当 >50% 错误是 `rate_limit` 时, 标题从 "API-blocked" 改为 "RATE LIMITED"
+  - 每个 task 显示主要错误类型: `(5/5 rate_limit)` 或 `(3/3 no_data)`
+  - rate_limit 主导时结论: "Daily API quota exhausted (USER_DAILY_QUERY_OVER_LIMIT) — not model fault"
+- [x] **Section 5 新增 Rate-limited task ID 清单**:
+  - 表格: task_id, score, rl_errs, calls, rl%, type — 最多 15 个
+  - 对比: "Rate-limited avg=X vs non-rate-limited avg=Y"
+  - 全部受限时: "all tasks hit quota — no unaffected baseline"
+- [x] 跑 UID 142/78 验证
+
+**迭代 56 结果**:
+
+**UID 142 (recent 30, 100% rate_limit)**:
+```
+F4. POI API FAILURE: avg error rate 98% — 19/30 tasks RATE LIMITED
+   task    736101214  score=  0.1  err=100% (5/5 rate_limit)  type=family_study
+   ...
+   Error types: rate_limit=185
+   → Daily API quota exhausted (USER_DAILY_QUERY_OVER_LIMIT) — not model fault
+
+Rate-limited tasks (30 affected by USER_DAILY_QUERY_OVER_LIMIT):
+       task_id  score rl_errs calls   rl%           type
+   ───────────────────────────────────────────────────────
+      63818948    0.1      15    15  100%      food_tour
+   ... (30 tasks)
+   Rate-limited avg=7.3 (all tasks hit quota — no unaffected baseline)
+```
+
+**UID 78 (recent 25, 混合错误)**:
+```
+Rate-limited tasks (9 affected by USER_DAILY_QUERY_OVER_LIMIT):
+   806974391    8.9       4    15   27%      food_tour
+   928777914   74.6       1    15    7%   family_study  ← 即使 74.6 分也被限流过
+   Rate-limited avg=25.2 vs non-rate-limited avg=17.2
+```
+
+**结论**: 对端限制 (USER_DAILY_QUERY_OVER_LIMIT) 是所有矿工共享的高德 API 每日配额。受限任务有明确的 task ID 清单, 错误类型和影响量化。即使高分任务 (74.6) 也会偶尔触发配额限制, 但通过工具多样化可以恢复。
+
+### 迭代 55 (2026-03-19) — A2 rate_limit 因果解释 + 验证 ✅
+- [x] A2 (Reduce repetitive calls) 因果解释升级: 当过度调用工具的主要错误是 `rate_limit` 时:
+  - "Cause: API daily quota (rate_limit N/M errors) — switch to other tools immediately after first quota error"
+  - 非 rate_limit 时保持原有逻辑: "stop retrying" (高 err) 或 "diversify earlier" (低 err)
+- [x] 跑 UID 142/78/71/15 验证 — 四种场景正确区分:
+  - UID 142 (88% err, 100% rate_limit): "API daily quota" ✓
+  - UID 78 (10% err): "diversify earlier" ✓
+  - UID 71 (100% err, 100% rate_limit): "API daily quota" + 单任务警告 ✓
+  - UID 15 (9% err): no A2 触发 (无 OVER-CALLED 工具) ✓
+
+**迭代 55 结果 (UID 15, recent 30)**:
+- avg=11.2, 3% good+, 77% poor — VERY WEAK, declining (-14)
+- Error cause: rate_limit 54%, no_data 35%, api_error 12% — 即使健康矿工也有过半错误来自配额
+- 参数质量 100% — 确认零模型调用错误
+- 开局 gap: `weather → poi_search → poi_search` avg=34 vs `poi_search×3` avg=10 (+24 pts)
+
+**不足**: `no_data` (34.6%) 作为 "ambiguous" 错误需要进一步分析 — 查询参数合法但无结果可能是 (1) 查询过于具体 ("大理 禅修体验") 或 (2) 目的地城市 POI 数据稀疏。区分这两种原因需要交叉检查同一城市的其他查询是否成功, 但在当前数据粒度下难以实现。
+
+### 迭代 54 (2026-03-19) — 错误根因精确分类: rate_limit vs no_data vs api_error ✅
+- [x] 错误分类从 4 类升级为 6 类:
+  - `rate_limit`: USER_DAILY_QUERY_OVER_LIMIT, over_limit, rate limit, quota, 429 等 → **100% 对端限制**
+  - `no_data`: "No POI data available", no results, not found → **查询合法但无数据** (可能是稀疏地区)
+  - `api_error`: "Error executing tool" (通用服务端错误) → **对端问题**
+  - `timeout`, `empty`, `tool_error`: 保持不变
+- [x] Section 5 新增 **Error cause breakdown** — 精确统计各类错误占比 + 中文标注:
+  - `rate_limit   386 (100.0%)  server quota (not model fault)`
+  - `no_data        9 ( 27.3%)  no data for query (ambiguous)`
+- [x] `is_api_blocked` 更新: `rate_limit + api_error + timeout` 均算服务端错误
+- [x] F4/F11 的 Error types 自动使用新分类
+- [x] Executive Summary `--all` 提示: Good+ ≤ 2 时提示扩大数据窗口
+- [x] 跑 UID 142 --all --recent 50 + UID 78 recent 25 验证
+
+**迭代 54 结果 — 彻底回答 "如何判断 API error 原因"**:
+
+| 矿工 | 总错误 | rate_limit | no_data | api_error | 结论 |
+|------|--------|-----------|---------|-----------|------|
+| UID 142 (--all 50) | 386 | **386 (100%)** | 0 | 0 | 全部对端限制 |
+| UID 78 (recent 25) | 33 | 15 (45.5%) | 9 (27.3%) | 9 (27.3%) | 混合, 但无模型错误 |
+
+**关键发现**:
+1. **87.5% 的 poi_search 错误消息是 `USER_DAILY_QUERY_OVER_LIMIT`** — 高德 API 每日配额耗尽
+2. **0% 是模型调用错误** — Section 6 工具参数质量 100%, 错误全部来自对端
+3. `no_data` (7.8%) 可能是查询过于具体 (如 "大理 禅修体验") 导致无结果, 但参数格式正确
+4. 即使 "健康" 矿工 (UID 78, 10% err) 也有 45% 的错误是 rate_limit — 说明配额是全局共享的
+
+### 迭代 53 (2026-03-19) — --all 提示 + 显示修复 + 开局策略 per-type 引导 ✅
+- [x] Executive Summary 新增 `--all` 提示: 当 Good+ ≤ 2 且非 --all 模式时, 显示 "Tip: only N Good+ task(s) — try --all or larger --recent"
+  - UID 71 (n=1 Good+): 提示正确显示
+  - UID 78 (n=3): 不显示 (Good+ 充足)
+  - UID 142 --all (n=7): 不显示 (已在 --all 模式)
+- [x] --all 模式显示修复: "770/200 (385%)" → "770 total, sampling list 200"
+- [x] 开局策略 A1 追加 "(aggregate; check 10.1 for per-type)" 引导
+- [x] 跑 UID 60 --all --recent 40 验证: 288 total tasks, 4 Good+, 报告完整正确
+
+**迭代 53 结果 (UID 60, --all recent 40)**:
+- avg=10.6, 10% good+, 80% poor — VERY WEAK, declining (-5)
+- 无 `--all` 提示 (n=4 Good+ > 2) — 正确
+- 11/40 API-blocked, adj avg=13.6
+- 3 per-type declines > 9 pts (business -21.7, family_study -14.3, intercity -9.9) — API 退化驱动
+- 288 total 正确显示, 非 385% bug
+
+**不足**: 报告质量已在多个维度达到收敛状态。剩余 不足 均为边际改进 (per-type bottleneck 小样本、A1 聚合 vs per-type 冲突已有引导)。后续迭代应关注新数据模式或环境变更, 而非脚本打磨。
+
+### 迭代 52 (2026-03-19) — --all 显示修复 + 开局策略 per-type 引导 ✅
+- [x] 修复 `--all` 模式下匹配率显示 bug: "770/200 (385.0%)" → "770 total, sampling list 200"
+  - stderr 和 report header 均修复
+  - sampling 模式 (非 --all) 保持原样: "108/200 sampling list, 54.0%"
+- [x] A1 开局策略 gap 追加 "(aggregate; check 10.1 for per-type)" 引导
+  - 防止聚合信号与 10.1 per-type 数据冲突 (如 food_tour 偏好 poi_search×3 而非 transport-first)
+- [x] 跑 UID 142 --all --recent 50 + UID 78 验证
+
+**迭代 52 结果 (UID 142, --all recent 50)**:
+- 770 total tasks, 50 analyzed — avg=9.8, 14% good+, 78% poor — VERY WEAK → adj. WEAK (avg=18.3, excl. 24 API-blocked)
+- 7 real Good+ tasks (n=7, 无 ghost) — 样本量充足, 推荐可靠
+- **10.1 终于有数据**: intercity transport-first (67% consensus, avg=43.8), food_tour poi_search×3 (100%, avg=56.9)
+- A1: transport-first +15 pts "(aggregate; check 10.1 for per-type)" — 正确引导读者查看 per-type
+- 开局 gap 与 10.1 的 "冲突" 是有意义的: transport-first 是整体最优, 但 food_tour 例外
+- 24/50 API-blocked, 16 MONO_TOOL (全 API-blocked), poi_search 88% err
+
+**不足**: 当 `--all --recent 50` 产出 n=7 Good+ (样本量充足) 但 `--recent 25` (sampling) 只有 n=1-2 Good+ 时, 报告质量差异很大。用户可能不知道应使用 `--all` 获取更可靠的分析。考虑在 Executive Summary 中当 sampling match% < 60% 时提示 "use --all for more data"。
+
+### 迭代 51 (2026-03-19) — F2 ghost 一致性 + 交叉引用 bug + A2/A3 单任务警告 ✅
+- [x] F2 (TOOL DIVERSITY + EFFICIENCY) Good+ gap 从 `good_tasks` → `s3_good` (ghost-excluded)
+- [x] Section 4 MONO_TOOL 交叉引用: "see F8" → "see MONO_TOOL in TOP FINDINGS" (修复编号漂移 bug)
+- [x] A2/A3 新增单任务警告: 当 s3_good n<=1 时显示 "⚠ Based on N Good+ task — verify with --all or larger window"
+  - UID 71 (n=1): A3 + A4 均显示警告 — 提醒读者推荐基于单一任务
+  - UID 78 (n=3): 无警告 — 正确
+- [x] 跑 UID 78/71 验证通过
+
+**迭代 51 结果 (UID 78, recent 25)**:
+- avg=20.1, 24% good+, 60% poor — WEAK, stable
+- 56% think-only, 3 ghost high-scorers — Q12 持续活跃
+- F2 不触发 (r=0.120 < 0.2) — 工具多样性非预测因子 (Good+ 3.7 ≈ Poor 3.6)
+- A2: poi_search (8→3) "diversify earlier" (10% err, 策略原因) — 无单任务警告 (n=3)
+- A3: around_search (+40pp) — 无单任务警告
+- 4 suspicious underscorers: 3 个 all-HC-pass + diverse tools + score 12-14 → 全部是 LLM 瓶颈
+- 无 OPENING STRATEGY GAP — `poi_search×3` avg=23.8 已是最优开局 (健康 API)
+
+**不足**: UID 78 的 Section 1 per-type bottleneck 显示 business code=6.7, llm=0.7 (LLM bottleneck), 但仅有 2 个 business 任务且都是 poor tier (4.5, 14.5)。当类型样本量 <3 时, per-type bottleneck 可能是噪声。但添加小样本警告到每行会使表格过于冗长。当前行为可接受。
+
 ### 迭代 50 (2026-03-19) — F2 ghost 一致性 + Section 4 交叉引用 bug ✅
 - [x] F2 (TOP FINDINGS: TOOL DIVERSITY + TOOL EFFICIENCY) 的 Good+ gap 从 `good_tasks` 切换到 `s3_good`
   - 与 Section 3/8.2/10.1/A2/A3 全部一致使用 ghost-excluded Good+
@@ -1225,7 +1825,7 @@ Good+ trades around_search (-0.6) → search_flights (+0.6) + search_train_ticke
 
 | 产出 | 描述 |
 |------|------|
-| `scripts/analyze_navworld.py` (2564行, 源码重建+增强) | Executive Summary (含 API-adjusted score) + TOP FINDINGS (F1-F11 合并+ghost-excluded, API-BLOCKED IDs, MONO_TOOL 根因分解) + 10-section 分析 + 开局策略差距→A1 + 工具频次(OVER/UNDER-CALLED+误差率交叉验证, BUDGET SINK, ghost-excluded Good+) + 错误分类 + 可疑低分 + SFT action plan (开局策略/因果解释/高错误率过滤/ghost-excluded) + 可靠预测步骤选择 + deep dump + 编造按类型 + ghost 全面排除 |
+| `scripts/analyze_navworld.py` (2684行, 源码重建+增强) | Executive Summary (含 API-adjusted score + --all 提示 + env-invalidated 风险) + TOP FINDINGS (F1-F11+ghost-excluded, RATE LIMITED IDs, MONO_TOOL 根因分解, F2 diversity/efficiency 自动切换) + 10-section 分析 + 开局策略差距→A1 + 工具频次(OVER/UNDER-CALLED+误差率交叉验证, BUDGET SINK, ghost-excluded Good+) + 精确错误分类(rate_limit/no_data/api_error) + Error cause breakdown + Rate-limited task ID 清单 + **env-invalidated 检测 (score_breakdown.error)** + 可疑低分 + SFT action plan (开局策略/rate_limit因果/高错误率过滤/ghost-excluded/单任务警告) + 可靠预测步骤选择 + deep dump + 编造按类型 + ghost 全面排除 |
 | `scripts/detect_think_blocks.py` (~330行) | Think-block 漏洞检测 + 量化 + 跨矿工对比 |
 | `scripts/synth_navworld_sft.py` (~420行) | SFT 训练数据提取, 质量评分, transport grounding |
 | `scripts/verify_navworld_sft.py` (~220行) | 离线 HC 评分验证 |
@@ -1234,22 +1834,25 @@ Good+ trades around_search (-0.6) → search_flights (+0.6) + search_train_ticke
 | `session/navworld_sft_data_v2.jsonl` (92条) | 已废弃 — 18.5% think-only 污染 |
 | `session/navworld_final_report.md` | 环境开发者行动报告 (覆盖迭代 1-19) |
 
-**核心发现**: (1) **P0: `<think>` 块未剥离** — 25 幽灵高分, 仅影响 reasoning model (Q12); UID 60 (非 reasoning) 不受影响 (2) unique_tools 是分数最强预测因子 (r=0.273-0.536) (3) 非 reasoning model 有独立问题: 10% synthesis failure
+**核心发现**: (1) **P0: `<think>` 块未剥离** — 25 幽灵高分, 仅影响 reasoning model (Q12) (2) **P0: MCP cache 0% 命中率** — pickle 序列化 bug 导致 USER_DAILY_QUERY_OVER_LIMIT, 已修复 (commit 9530c56) (3) unique_tools 是分数最强预测因子 (r=0.273-0.683) (4) 非 reasoning model 有独立问题: 10% synthesis failure
 **SFT 策略**: v3 (92条, 100% HC pass, avg 45.1) 已清除 think-block + 类型均衡; 7 种类型均 ≥10 条; 来自 6 矿工去重; API 健康后 poi_search 开局重新可行; transport-first 仍是 intercity/hybrid/business 最优; 工具多样性 (unique≥4) 仍是核心差异
 
 问题区
 
-### Q9: POI API 恶化 → ✅ 2026-03-15 已恢复
+### Q9: POI API 恶化 → ✅ 根因确认 + 修复 (commit 9530c56, 2026-03-19)
 - Q1→Q4: POI 失败率从 5-13% 暴涨到 97-98% (跨矿工一致)
-- **2026-03-15 恢复**: POI err 降至 0-5%, score 恢复到 14-28
-- 恢复是跨矿工一致的 — 确认是环境端修复
-- 这不是采样列表变化 — 是 API rate limit 正在随时间收紧
-- **需要立即通知环境开发者**: API 限流已让 navworld 评分几乎无意义
+- 2026-03-15 临时恢复, 但后续再次恶化 (recent 数据仍 75-98% err)
+- **根因 (2026-03-19 确认)**: MCP cache 的 `pickle.loads()` 对 Pydantic v2 `CallToolResult` 静默失败
+  - 生产证据: 4,336 缓存条目 access_count=0 — **0% 缓存命中率**
+  - 结果: 所有 poi_search 调用直接请求高德 API → ~35,000 daily calls → 每日配额耗尽
+- **修复**: commit 9530c56 — pickle → JSON 序列化 + cache.set try/except + 坐标归一化
+- **预期**: 部署后 POI 错误率从 90%+ 降至 <10%
 
-### Q1: 所有矿工 NAVWORLD 低分 — 根因链完整 ✅ 最终确认
+### Q1: 所有矿工 NAVWORLD 低分 — ✅ 根因完整闭合
 - API 35-37% 全量失败率 (全采样列表, 非 recent N)
 - **跨矿工 r=0.85-0.90**: 同一 task 在不同矿工中表现一致 → 环境端确认
-- 根因链: API rate limit → poi_search/around_search 共享限额 → 工具返回无数据 → MONO_TOOL → HC failure → 低分
+- **完整根因链**: pickle 序列化 bug → 0% cache hit → 35K daily API calls → USER_DAILY_QUERY_OVER_LIMIT → poi_search 100% 失败 → MONO_TOOL → HC failure → 低分
+- 修复: commit 9530c56 (JSON 替代 pickle)
 
 ### Q2: tool argument quality — 关闭
 - 不影响实际评分，无需进一步分析

@@ -52,7 +52,7 @@ ENV_CONFIGS = {
         "module": "scripts.analyze_game",
     },
     "swe": {
-        "env_name": "SWE-SYNTH",
+        "env_name": "SWE-INFINITE",
         "script": "scripts/analyze_swe.py",
         "module": "scripts.analyze_swe",
     },

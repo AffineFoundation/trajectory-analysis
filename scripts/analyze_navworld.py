@@ -209,6 +209,11 @@ class TrajectoryData:
         self.score_breakdown = extra.get("score_breakdown", {}) or {}
         self.hard_constraints = self.score_breakdown.get("hard_constraints", {}) or {}
 
+        # Environment-side error: evaluation invalidated due to API rate limits etc.
+        # (commit c9c72b3: score_breakdown.error set when env detects OVER_LIMIT)
+        self.env_error = self.score_breakdown.get("error", None)
+        self.is_env_invalidated = self.env_error is not None
+
         # Code / LLM scores (production uses noisy_code/noisy_llm bands)
         self.code_total = float(self.score_breakdown.get("noisy_code", 0) or 0)
         self.llm_total = float(self.score_breakdown.get("noisy_llm", 0) or 0)
@@ -261,10 +266,12 @@ class TrajectoryData:
             self.tool_sequence.append(name)
 
             # Detect errors and classify error type
+            # Categories: rate_limit (server quota), no_data (query ok but no results),
+            #             api_error (other server errors), timeout, empty, tool_error
             result = entry.get("result", entry.get("output", ""))
             result_str = str(result) if result else ""
             is_error = False
-            err_type = ""  # api_error, timeout, empty, tool_error
+            err_type = ""
             result_lower = result_str.lower()
             if entry.get("error"):
                 is_error = True
@@ -274,15 +281,20 @@ class TrajectoryData:
                 is_error = True
                 err_type = "timeout"
             elif any(kw in result_lower for kw in
-                     ["error executing tool", "api response", "api error",
-                      "rate limit", "over_limit", "quota", "限流",
-                      "超限", "forbidden", "unauthorized", "429",
-                      "mcp connection failed", "tool execution failed"]):
+                     ["over_limit", "rate limit", "rate_limit", "quota",
+                      "限流", "超限", "429", "too many requests"]):
                 is_error = True
-                err_type = "api_error"
+                err_type = "rate_limit"
             elif any(kw in result_lower for kw in
-                     ["error", "failed", "invalid", "not found",
-                      "no results", "no data", "empty", "[]", "count: 0"]):
+                     ["no poi data", "no data available", "no results",
+                      "not found", "no data", "empty", "[]", "count: 0"]):
+                is_error = True
+                err_type = "no_data"
+            elif any(kw in result_lower for kw in
+                     ["error executing tool", "api response", "api error",
+                      "forbidden", "unauthorized",
+                      "mcp connection failed", "tool execution failed",
+                      "error", "failed", "invalid"]):
                 is_error = True
                 err_type = "api_error"
             elif not result_str or result_str.strip() in ("", "{}", "null", "None"):
@@ -309,11 +321,17 @@ class TrajectoryData:
         self.err_type_counts = Counter(
             c["err_type"] for c in self.tool_calls if c["error"]
         )
-        # API-blocked: >80% calls failed with API/infra errors, not model's fault
-        api_errs = self.err_type_counts.get("api_error", 0) + self.err_type_counts.get("timeout", 0)
+        # Server-side errors: rate_limit + api_error + timeout (not model's fault)
+        # no_data is ambiguous (query valid but no results — could be bad query or sparse data)
+        server_errs = (self.err_type_counts.get("rate_limit", 0)
+                       + self.err_type_counts.get("api_error", 0)
+                       + self.err_type_counts.get("timeout", 0))
+        self.rate_limit_count = self.err_type_counts.get("rate_limit", 0)
+        api_errs = server_errs
         self.is_api_blocked = (
-            self.total_calls > 0
-            and api_errs / max(self.total_calls, 1) > 0.80
+            self.is_env_invalidated  # authoritative: env marked as invalid
+            or (self.total_calls > 0
+                and api_errs / max(self.total_calls, 1) > 0.80)
         )
 
         # POI-specific error rate
@@ -799,8 +817,11 @@ def generate_report(
     w(f"NAVWORLD TRAJECTORY ANALYSIS — UID {uid}")
     w(f"{'='*80}")
     w(f"  Hotkey:     {hotkey}...  Revision: {revision}...")
-    w(f"  Tasks:      {len(trajectories)} analyzed ({matched}/{sl_size} sampling list, "
-      f"{matched/max(sl_size,1)*100:.1f}%)")
+    if matched > sl_size and sl_size > 0:
+        w(f"  Tasks:      {len(trajectories)} analyzed ({matched} total, sampling list {sl_size})")
+    else:
+        w(f"  Tasks:      {len(trajectories)} analyzed ({matched}/{sl_size} sampling list, "
+          f"{matched/max(sl_size,1)*100:.1f}%)")
     if parse_errors:
         w(f"  Parse errs: {parse_errors}")
     w(f"  Score:      avg={_safe_mean(scores):.1f}  med={_safe_median(scores):.1f}  "
@@ -899,6 +920,9 @@ def generate_report(
         risks.append(f"{to_pct:.0f}% think-only")
     if avg_poi_err > 0.15:
         risks.append(f"POI API {avg_poi_err*100:.0f}% err")
+    env_inv_n = sum(1 for t in trajectories if t.is_env_invalidated)
+    if env_inv_n > 0:
+        risks.append(f"{env_inv_n} env-invalidated (rate limit)")
     zero_tool_n = sum(1 for t in trajectories if t.total_calls == 0)
     if zero_tool_n / n > 0.1:
         risks.append(f"{zero_tool_n} zero-tool tasks")
@@ -934,6 +958,15 @@ def generate_report(
       f"worst: {worst_type} ({type_avgs.get(worst_type, 0):.0f})")
     if risks:
         w(f"  Risks: {' | '.join(risks)}")
+    # Detect bimodal distribution: tasks cluster at good+ and poor, none in between.
+    # This means the average is misleading (no task actually scores near it).
+    acceptable_tasks = [t for t in trajectories if t.tier == "acceptable"]
+    if len(acceptable_tasks) == 0 and good_tasks and poor_tasks:
+        w(f"  ⚠ Bimodal: 0% acceptable — tasks either succeed (≥30) or fail (<15), "
+          f"avg {avg_score:.0f} is misleading")
+    # Suggest --all when Good+ sample is very small (sampling mode only)
+    if len(s3_good) <= 2 and matched <= sl_size and sl_size > 0:
+        w(f"  Tip: only {len(s3_good)} Good+ task(s) — try --all or larger --recent for more reliable recommendations")
 
     # ════════════════════════════════════════════════════════════════════════
     # TOP FINDINGS (highest-value insights first)
@@ -956,9 +989,15 @@ def generate_report(
         w(f"     → Code score is low; improving tool data usage (IC) and content completeness")
         w(f"       will have the highest score impact")
 
-    # F2: Tool diversity or efficiency
+    # F2: Tool diversity or efficiency — pick the stronger signal
     r_total_score = _pearson([t.total_calls for t in trajectories], scores)
-    if r_tools_score is not None and abs(r_tools_score) > 0.2:
+    # Prefer efficiency when total_calls correlation is much stronger than diversity
+    prefer_efficiency = (r_total_score is not None and r_tools_score is not None
+                         and abs(r_total_score) > abs(r_tools_score) * 2
+                         and r_total_score < -0.3)
+    # F2: TOOL DIVERSITY — only when POSITIVE correlation (more diverse → higher score)
+    # Negative r means more tools → lower score, which is a different signal
+    if r_tools_score is not None and r_tools_score > 0.2 and not prefer_efficiency:
         finding_num += 1
         w(f"\n  F{finding_num}. TOOL DIVERSITY is the strongest score predictor (r={r_tools_score:.3f})")
         if s3_good and poor_tasks:
@@ -966,8 +1005,9 @@ def generate_report(
             p_uniq = _safe_mean([t.unique_tools for t in poor_tasks])
             w(f"     Good+ avg unique tools: {g_uniq:.1f}  |  Poor: {p_uniq:.1f}  |  Gap: {g_uniq-p_uniq:+.1f}")
         w(f"     → Using 4+ different tool types is strongly associated with higher scores")
-    elif (r_tools_score is not None and abs(r_tools_score) <= 0.2
-          and r_total_score is not None and r_total_score < -0.3):
+    elif (prefer_efficiency
+          or (r_tools_score is not None and r_tools_score <= 0.2
+              and r_total_score is not None and r_total_score < -0.3)):
         # Diversity doesn't matter but more calls = lower score → efficiency finding
         finding_num += 1
         w(f"\n  F{finding_num}. TOOL EFFICIENCY matters more than diversity")
@@ -1000,13 +1040,24 @@ def generate_report(
         # Consolidated: high API error + specific blocked tasks
         finding_num += 1
         api_blocked_sorted = sorted(api_blocked, key=lambda t: t.error_rate, reverse=True)
+        # Count rate-limited vs other server errors
+        total_rl = sum(t.rate_limit_count for t in api_blocked)
+        total_server = sum(t.err_type_counts.get("rate_limit", 0)
+                          + t.err_type_counts.get("api_error", 0)
+                          + t.err_type_counts.get("timeout", 0) for t in api_blocked)
+        rl_dominant = total_rl > total_server * 0.5 and total_rl > 0
+        cause_label = "RATE LIMITED" if rl_dominant else "API-blocked"
         w(f"\n  F{finding_num}. POI API FAILURE: avg error rate {avg_poi_err*100:.0f}% — "
-          f"{len(api_blocked)}/{n} tasks API-blocked")
+          f"{len(api_blocked)}/{n} tasks {cause_label}")
         shown = api_blocked_sorted[:10]
         for t in shown:
-            api_e = t.err_type_counts.get("api_error", 0) + t.err_type_counts.get("timeout", 0)
+            server_e = (t.err_type_counts.get("rate_limit", 0)
+                        + t.err_type_counts.get("api_error", 0)
+                        + t.err_type_counts.get("timeout", 0))
+            # Show dominant error type per task
+            dominant = t.err_type_counts.most_common(1)[0][0] if t.err_type_counts else "?"
             w(f"     task {t.task_id:>12d}  score={t.score:5.1f}  err={t.error_rate:.0%} "
-              f"({api_e}/{t.total_calls} api/infra)  type={t.problem_type}")
+              f"({server_e}/{t.total_calls} {dominant})  type={t.problem_type}")
         if len(api_blocked) > 10:
             w(f"     ... and {len(api_blocked)-10} more")
         all_api_err_types = Counter()
@@ -1015,8 +1066,12 @@ def generate_report(
         if all_api_err_types:
             breakdown = ", ".join(f"{k}={v}" for k, v in all_api_err_types.most_common())
             w(f"     Error types: {breakdown}")
-        w(f"     → These tasks scored low due to server-side API failures, not model quality")
-        w(f"       Exclude from model evaluation or re-run after API fix")
+        if rl_dominant:
+            w(f"     → Daily API quota exhausted (USER_DAILY_QUERY_OVER_LIMIT) — not model fault")
+            w(f"       Exclude from model evaluation or re-run when quota resets")
+        else:
+            w(f"     → These tasks scored low due to server-side API failures, not model quality")
+            w(f"       Exclude from model evaluation or re-run after API fix")
         _f4_has_blocked = True
     elif avg_poi_err > 0.15:
         finding_num += 1
@@ -1115,11 +1170,16 @@ def generate_report(
     # F10: TOOL BUDGET SATURATION (most tasks hit max tool calls)
     # Note: MAX_TOOL_STEPS=15 is an environment ceiling (config.py), NOT a requirement.
     # Models CAN stop early by not requesting more tool calls.
+    # Use env ceiling (15) as reference, not max observed — outlier tasks with >15 calls
+    # (e.g., parallel tool calls within a step) would skew the dynamic max and mask
+    # saturation at the true ceiling.
+    ENV_TOOL_CEILING = 15
     if n >= 10:
+        at_ceil = sum(1 for t in trajectories if t.total_calls >= ENV_TOOL_CEILING)
+        at_ceil_pct = at_ceil / n * 100
         max_calls = max(t.total_calls for t in trajectories)
-        at_max = sum(1 for t in trajectories if t.total_calls >= max_calls)
-        at_max_pct = at_max / n * 100
-        if at_max_pct >= 70 and max_calls >= 10:
+        over_ceil = sum(1 for t in trajectories if t.total_calls > ENV_TOOL_CEILING)
+        if at_ceil_pct >= 70:
             finding_num += 1
             def _has_rep5(t):
                 for i in range(len(t.tool_sequence) - 4):
@@ -1127,8 +1187,9 @@ def generate_report(
                         return True
                 return False
             rep_pct = sum(1 for t in trajectories if _has_rep5(t)) / n * 100
-            w(f"\n  F{finding_num}. TOOL BUDGET SATURATION: {at_max}/{n} ({at_max_pct:.0f}%) tasks "
-              f"hit {max_calls} calls (env MAX_TOOL_STEPS ceiling)")
+            ceil_label = f"{ENV_TOOL_CEILING}" if over_ceil == 0 else f"{ENV_TOOL_CEILING}+ (max {max_calls})"
+            w(f"\n  F{finding_num}. TOOL BUDGET SATURATION: {at_ceil}/{n} ({at_ceil_pct:.0f}%) tasks "
+              f"hit {ceil_label} calls (env MAX_TOOL_STEPS ceiling)")
             w(f"     → Model always exhausts the environment's tool budget (models CAN stop early)")
             if rep_pct > 50:
                 rep_tool_counts = Counter()
@@ -1143,11 +1204,12 @@ def generate_report(
                       f"(mostly {top_rep[0]}) — SFT should teach early stopping")
             # Budget reallocation insight: when saturated, show what Good+ tasks
             # trade away to make room for differentiating tools
-            if good_tasks and poor_tasks:
+            # Use s3_good (ghost-excluded) for consistency with Section 3/A2/A3
+            if s3_good and poor_tasks:
                 realloc_from = []  # tools Poor uses more
                 realloc_to = []    # tools Good+ uses more
                 for tool in ALL_TOOLS:
-                    gf = _safe_mean([t.tools_used.get(tool, 0) for t in good_tasks])
+                    gf = _safe_mean([t.tools_used.get(tool, 0) for t in s3_good])
                     pf = _safe_mean([t.tools_used.get(tool, 0) for t in poor_tasks])
                     d = gf - pf
                     if d < -0.5:
@@ -1166,12 +1228,20 @@ def generate_report(
     if not _f4_has_blocked and api_blocked:
         finding_num += 1
         api_blocked_sorted = sorted(api_blocked, key=lambda t: t.error_rate, reverse=True)
-        w(f"\n  F{finding_num}. API-BLOCKED TASKS: {len(api_blocked)}/{n} tasks failed due to API/infrastructure errors")
+        total_rl_f11 = sum(t.rate_limit_count for t in api_blocked)
+        total_srv_f11 = sum(t.err_type_counts.get("rate_limit", 0)
+                            + t.err_type_counts.get("api_error", 0)
+                            + t.err_type_counts.get("timeout", 0) for t in api_blocked)
+        cause_f11 = "RATE LIMITED" if total_rl_f11 > total_srv_f11 * 0.5 else "API-blocked"
+        w(f"\n  F{finding_num}. {cause_f11} TASKS: {len(api_blocked)}/{n} tasks failed due to server-side errors")
         shown = api_blocked_sorted[:10]
         for t in shown:
-            api_e = t.err_type_counts.get("api_error", 0) + t.err_type_counts.get("timeout", 0)
+            server_e = (t.err_type_counts.get("rate_limit", 0)
+                        + t.err_type_counts.get("api_error", 0)
+                        + t.err_type_counts.get("timeout", 0))
+            dominant = t.err_type_counts.most_common(1)[0][0] if t.err_type_counts else "?"
             w(f"     task {t.task_id:>12d}  score={t.score:5.1f}  err={t.error_rate:.0%} "
-              f"({api_e}/{t.total_calls} api/infra)  type={t.problem_type}")
+              f"({server_e}/{t.total_calls} {dominant})  type={t.problem_type}")
         if len(api_blocked) > 10:
             w(f"     ... and {len(api_blocked)-10} more")
         all_api_err_types = Counter()
@@ -1180,7 +1250,7 @@ def generate_report(
         if all_api_err_types:
             breakdown = ", ".join(f"{k}={v}" for k, v in all_api_err_types.most_common())
             w(f"     Error types: {breakdown}")
-        w(f"     → These tasks scored low due to server-side API failures, not model quality")
+        w(f"     → Server-side failures, not model quality")
 
     w(f"\n  {'─'*70}")
     w(f"  Total findings: {finding_num}")
@@ -1333,10 +1403,16 @@ def generate_report(
     # High vs Low tool diversity (s3_good = ghost-excluded Good+, pre-computed above)
     if s3_good and poor_tasks:
         small_gp = len(s3_good) < 5
+        small_poor = len(poor_tasks) < 3
         ghost_note = f", excl. {n_ghost_in_good} ghost" if n_ghost_in_good else ""
-        gp_warn = f"  ⚠ small Good+ sample (n={len(s3_good)}{ghost_note})" if small_gp else ""
-        if not small_gp and n_ghost_in_good:
-            gp_warn = f"  (excl. {n_ghost_in_good} ghost)"
+        warns = []
+        if small_gp:
+            warns.append(f"Good+ n={len(s3_good)}{ghost_note}")
+        elif n_ghost_in_good:
+            warns.append(f"excl. {n_ghost_in_good} ghost")
+        if small_poor:
+            warns.append(f"Poor n={len(poor_tasks)}")
+        gp_warn = f"  ⚠ small sample ({', '.join(warns)})" if warns else ""
         w(f"\n  Tool diversity: Good+ vs Poor:{gp_warn}")
         w(f"    {'Metric':20s} {'Good+':>8s} {'Poor':>8s} {'Delta':>8s}")
         w(f"    {'─'*50}")
@@ -1366,6 +1442,9 @@ def generate_report(
         w(f"    {'─'*62}")
         over_alloc = []
         under_alloc = []
+        # Pre-compute Good+/Poor total calls for share-based confound check
+        g_total_calls = _safe_mean([t.total_calls for t in s3_good]) if s3_good else 0
+        p_total_calls = _safe_mean([t.total_calls for t in poor_tasks]) if poor_tasks else 0
         for tool in ALL_TOOLS:
             g_freq = _safe_mean([t.tools_used.get(tool, 0) for t in s3_good])
             p_freq = _safe_mean([t.tools_used.get(tool, 0) for t in poor_tasks])
@@ -1373,12 +1452,24 @@ def generate_report(
             # Classify signal: absolute threshold for common tools,
             # relative threshold for rare tools (delta>0.4 AND ratio>2.5x)
             max_freq = max(g_freq, p_freq)
+            # Confound check: if tool's share of calls is similar or lower in
+            # Good+ vs Poor, the absolute delta is driven by total call volume
+            # difference, not by specific prioritization of this tool.
+            g_share = g_freq / g_total_calls if g_total_calls > 0 else 0
+            p_share = p_freq / p_total_calls if p_total_calls > 0 else 0
+            share_confounded = (
+                g_share <= p_share + 0.05  # Good+ share not meaningfully higher
+                and g_total_calls > p_total_calls * 1.3  # Good+ has >30% more total calls
+            )
             if delta < -1.0 and p_freq >= 2.0:
                 signal = "OVER-CALLED"
                 over_alloc.append((tool, g_freq, p_freq))
             elif delta > 1.0 and g_freq >= 1.0:
-                signal = "UNDER-CALLED"
-                under_alloc.append((tool, g_freq, p_freq))
+                if share_confounded:
+                    signal = "(volume)"
+                else:
+                    signal = "UNDER-CALLED"
+                    under_alloc.append((tool, g_freq, p_freq))
             elif (delta > 0.4 and max_freq < 2.0
                   and g_freq > 0.3 and p_freq < g_freq * 0.4):
                 signal = "UNDER-CALLED"
@@ -1421,7 +1512,8 @@ def generate_report(
                 share = total_tool / max(total_all, 1) * 100
                 if share < 30:
                     continue
-                g_freq = _safe_mean([t.tools_used.get(tool, 0) for t in good_tasks])
+                # Use s3_good (ghost-excluded) for consistency with Section 3/A2/A3
+                g_freq = _safe_mean([t.tools_used.get(tool, 0) for t in s3_good]) if s3_good else 0
                 p_freq = _safe_mean([t.tools_used.get(tool, 0) for t in poor_tasks])
                 if abs(g_freq - p_freq) < 1.0:
                     r_tool_score = _pearson(
@@ -1447,7 +1539,15 @@ def generate_report(
     # Opening strategy insight: flag when most common opening is not the best
     opening_gap = None  # (best_seq, best_avg, mc_seq, mc_avg) — reused in SFT Action Plan
     if len(openings) >= 2:
-        most_common_seq = openings.most_common(1)[0][0]
+        # When multiple openings tie in frequency, pick the one with the LOWEST avg
+        # as "most common" — this maximizes gap detection (worst default vs best alt)
+        top_count = openings.most_common(1)[0][1]
+        tied = [seq for seq, cnt in openings.items()
+                if cnt == top_count and len(opening_scores.get(seq, [])) >= 2]
+        if tied:
+            most_common_seq = min(tied, key=lambda s: _safe_mean(opening_scores.get(s, [0])))
+        else:
+            most_common_seq = openings.most_common(1)[0][0]
         mc_avg = _safe_mean(opening_scores[most_common_seq])
         # Find best opening (by avg score, minimum 2 uses to avoid noise)
         best_seq, best_avg = None, mc_avg
@@ -1611,6 +1711,42 @@ def generate_report(
         w(f"    POI partial:     {len(partial):4d}  avg score={_safe_mean([t.score for t in partial]):.1f}")
         w(f"    POI all-fail:    {len(all_fail):4d}  avg score={_safe_mean([t.score for t in all_fail]):.1f}")
 
+    # Error cause breakdown — distinguish server-side (rate limit) from other errors
+    all_err_types = Counter()
+    for t in trajectories:
+        all_err_types.update(t.err_type_counts)
+    total_errs = sum(all_err_types.values())
+    if total_errs > 0:
+        w(f"\n  Error cause breakdown ({total_errs} total errors):")
+        for etype, cnt in all_err_types.most_common():
+            label = {"rate_limit": "server quota (not model fault)",
+                     "no_data": "no data for query (ambiguous)",
+                     "api_error": "other API error (server-side)",
+                     "timeout": "timeout (server-side)",
+                     "empty": "empty response",
+                     "tool_error": "tool framework error"}.get(etype, etype)
+            w(f"    {etype:15s} {cnt:5d} ({cnt/total_errs*100:5.1f}%)  {label}")
+
+    # Rate-limited task details
+    rl_tasks = [(t, t.rate_limit_count) for t in trajectories if t.rate_limit_count > 0]
+    if rl_tasks:
+        rl_tasks.sort(key=lambda x: -x[1])
+        w(f"\n  Rate-limited tasks ({len(rl_tasks)} affected by USER_DAILY_QUERY_OVER_LIMIT):")
+        w(f"    {'task_id':>12s} {'score':>6s} {'rl_errs':>7s} {'calls':>5s} {'rl%':>5s} {'type':>14s}")
+        w(f"    {'─'*55}")
+        for t, rl in rl_tasks[:15]:
+            rl_pct = rl / max(t.total_calls, 1) * 100
+            w(f"    {t.task_id:>12d} {t.score:6.1f} {rl:7d} {t.total_calls:5d} {rl_pct:4.0f}% {t.problem_type:>14s}")
+        if len(rl_tasks) > 15:
+            w(f"    ... and {len(rl_tasks)-15} more")
+        # Summary stats
+        rl_scores = [t.score for t, _ in rl_tasks]
+        non_rl = [t for t in trajectories if t.rate_limit_count == 0 and t.total_calls > 0]
+        if non_rl:
+            w(f"    Rate-limited avg={_safe_mean(rl_scores):.1f} vs non-rate-limited avg={_safe_mean([t.score for t in non_rl]):.1f}")
+        else:
+            w(f"    Rate-limited avg={_safe_mean(rl_scores):.1f} (all tasks hit quota — no unaffected baseline)")
+
     # around_search as fallback
     around_tasks = [t for t in trajectories if "around_search" in t.tools_used]
     if around_tasks:
@@ -1756,14 +1892,24 @@ def generate_report(
             w(f"    {t.task_id:>12d} {t.score:6.1f} {t.problem_type:>14s} {t.unique_tools:4d} "
               f"{t.error_rate*100:4.0f}% {t.user_len:6d} {t.code_total:5.1f} {t.llm_total:5.1f} "
               f"{_trunc(hc_str, 20):>20s} {reason_str}")
-        # Summary insight
+        # Summary insight: distinguish HC-blocked from LLM-quality-blocked
         hc_fail_counts = Counter()
+        all_pass_count = 0
         for _, _, fhc in suspicious:
-            for hc in fhc:
-                hc_fail_counts[hc] += 1
+            if fhc:
+                for hc in fhc:
+                    hc_fail_counts[hc] += 1
+            else:
+                all_pass_count += 1
+        if all_pass_count > len(suspicious) / 2:
+            # Majority pass all HC → pure LLM quality gap is the real blocker
+            avg_llm = _safe_mean([t.llm_total for t, _, fhc in suspicious if not fhc])
+            w(f"\n    → Primary blocker: LLM quality ({all_pass_count}/{len(suspicious)} "
+              f"pass all HC, avg LLM={avg_llm:.1f}/50 — output content quality, not tool/format)")
         if hc_fail_counts:
             top_block = hc_fail_counts.most_common(1)[0]
-            w(f"\n    → Primary blocker: {top_block[0]} ({top_block[1]}/{len(suspicious)} suspicious tasks)")
+            prefix = "    → Also blocked by: " if all_pass_count > len(suspicious) / 2 else "\n    → Primary blocker: "
+            w(f"{prefix}{top_block[0]} ({top_block[1]}/{len(suspicious)} suspicious tasks)")
             if top_block[0] == "required_tools_called":
                 # Check what tools are missing
                 for t, _, fhc in suspicious:
@@ -1789,6 +1935,18 @@ def generate_report(
     if r_err_score is not None:
         w(f"    Error rate ↔ score: r={r_err_score:.3f}")
 
+    # Detect confound: when error rate positively correlates with score,
+    # it's almost always because more total calls → more tool diversity → some errors
+    # naturally → higher score. The error rate per se doesn't help.
+    if r_err_score is not None and r_err_score > 0.15:
+        r_calls_score = _pearson(
+            [t.total_calls for t in trajectories], scores)
+        if r_calls_score is not None and r_calls_score > 0.2:
+            w(f"    ⚠ Confound: total_calls ↔ score r={r_calls_score:.3f} — more extensive tool")
+            w(f"      usage produces both more errors and higher scores (error rate is not causal)")
+        elif r_calls_score is not None:
+            w(f"    Note: positive error-score correlation may reflect task complexity or type mix")
+
     # Tasks with vs without errors (exclude zero-tool tasks from "without errors"
     # since 0 errors from 0 calls is not meaningful clean execution)
     has_err = [t for t in trajectories if t.total_errors > 0]
@@ -1797,6 +1955,8 @@ def generate_report(
     if has_err and no_err:
         w(f"    With errors:    avg={_safe_mean([t.score for t in has_err]):.1f} (n={len(has_err)})")
         w(f"    Without errors: avg={_safe_mean([t.score for t in no_err]):.1f} (n={len(no_err)})")
+        if min(len(has_err), len(no_err)) < 3:
+            w(f"    (⚠ one group has n<3 — comparison unreliable)")
     if zero_tool:
         w(f"    Zero-tool tasks: {len(zero_tool)} (excluded — 0 errors from 0 calls is not clean execution)")
 
@@ -2014,8 +2174,18 @@ def generate_report(
     around_err_pct = around_errs / max(around_total, 1) * 100
 
     if poi_err_pct > 30:
+        # Check if rate_limit is dominant error
+        all_et = Counter()
+        for t in trajectories:
+            all_et.update(t.err_type_counts)
+        rl_share = all_et.get("rate_limit", 0) / max(sum(all_et.values()), 1)
         w(f"    P1 API Infrastructure: poi_search {poi_err_pct:.0f}% error rate")
-        w(f"       → Fix API rate limits or increase quotas")
+        if rl_share > 0.5:
+            w(f"       Root cause: MCP cache 0% hit rate (Pydantic v2 pickle serialization bug)")
+            w(f"       → Fixed in commit 9530c56: JSON serialization replaces pickle")
+            w(f"       → Expected: POI errors should drop significantly after deployment")
+        else:
+            w(f"       → Fix API rate limits or increase quotas")
     if around_err_pct > 30:
         w(f"    P1 API Infrastructure: around_search {around_err_pct:.0f}% error rate (shared quota)")
     # Fabrication recommendation — guarded by correlation strength (Q4: high fab rates
@@ -2046,6 +2216,12 @@ def generate_report(
     if zero_tool:
         w(f"    P2 Zero-tool tasks: {len(zero_tool)}/{n} tasks made 0 tool calls (all score=0)")
         w(f"       → Model fails to initiate tool usage; check system prompt delivery")
+
+    # Q12: Think-block vulnerability — scorer doesn't strip <think> tags
+    if ghost_high:
+        w(f"    P0 SCORER: {len(ghost_high)} ghost high-scorers (score≥30 with 0 user content)")
+        w(f"       → Add <think> tag stripping: re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)")
+        w(f"       → Other envs (trace, lgc) already strip — QQR scorer does not (Q12)")
 
     w(f"    P3 Reward Shaping: Step reward concordance may need fundamental redesign (see Section 8.3)")
 
@@ -2110,7 +2286,7 @@ def generate_report(
         mc_str = " → ".join(mc_s)
         w(f"    A{action_num}. [HIGH] Switch opening strategy: '{best_str}' (avg={best_a:.0f}) "
           f"instead of '{mc_str}' (avg={mc_a:.0f})")
-        w(f"       +{best_a-mc_a:.0f} pts score gap — highest single-change impact")
+        w(f"       +{best_a-mc_a:.0f} pts score gap — highest single-change impact (aggregate; check 10.1 for per-type)")
 
     # A1: Score bottleneck → primary training focus
     action_num += 1
@@ -2141,18 +2317,34 @@ def generate_report(
         if over_tools:
             action_num += 1
             tool_str = ", ".join(f"{t} ({pf:.0f}→{gf:.0f})" for t, gf, pf, _ in over_tools)
-            w(f"    A{action_num}. [HIGH] Reduce repetitive calls: {tool_str}")
-            # Provide causal explanation based on error rate
+            # Priority based on magnitude: >2 call reduction is HIGH, otherwise MED
+            max_delta = max(pf - gf for _, gf, pf, _ in over_tools)
+            over_priority = "HIGH" if max_delta > 2.0 else "MED"
+            w(f"    A{action_num}. [{over_priority}] Reduce repetitive calls: {tool_str}")
+            # Provide causal explanation based on error rate + error type
             high_err_tools = [(t, er) for t, _, _, er in over_tools if er > 0.50]
             low_err_tools = [(t, er) for t, _, _, er in over_tools if er <= 0.50]
             if high_err_tools and not low_err_tools:
-                w(f"       Cause: API failures ({high_err_tools[0][1]*100:.0f}% err) — "
-                  f"stop retrying after 1-2 failures, switch to other tool types")
+                # Check if dominant error is rate_limit (use aggregate error type breakdown)
+                all_errs = Counter()
+                for t in trajectories:
+                    all_errs.update(t.err_type_counts)
+                total_all_errs = sum(all_errs.values())
+                rl_total = all_errs.get("rate_limit", 0)
+                if rl_total > total_all_errs * 0.5 and total_all_errs > 0:
+                    rl_pct = rl_total / total_all_errs * 100
+                    w(f"       Cause: API daily quota ({rl_pct:.0f}% of errors are rate_limit) — "
+                      f"switch to other tools immediately after first quota error")
+                else:
+                    w(f"       Cause: API failures ({high_err_tools[0][1]*100:.0f}% err) — "
+                      f"stop retrying after 1-2 failures, switch to other tool types")
             elif high_err_tools and low_err_tools:
                 he_str = ", ".join(f"{t} ({er*100:.0f}% err)" for t, er in high_err_tools)
                 w(f"       {he_str}: stop retrying failed API; others: Good+ diversifies earlier")
             else:
                 w(f"       Good+ tasks diversify earlier — redirect budget to transport/weather tools")
+            if len(s3_good) <= 1:
+                w(f"       ⚠ Based on {len(s3_good)} Good+ task — verify with --all or larger window")
 
     # A3: UNDER-CALLED tool → increase (skip tools with >50% error rate)
     if s3_good and poor_tasks:
@@ -2175,6 +2367,8 @@ def generate_report(
             tool_str = ", ".join(f"{t} (+{ga-pa:.0f}pp)" for t, ga, pa in under_tools)
             w(f"    A{action_num}. [MED] Increase adoption of: {tool_str}")
             w(f"       These tools have large Good+ vs Poor adoption gaps")
+            if len(s3_good) <= 1:
+                w(f"       ⚠ Based on {len(s3_good)} Good+ task — verify with --all or larger window")
         if high_err_skipped:
             skipped_str = ", ".join(f"{t} ({ter*100:.0f}% err)" for t, _, _, ter in high_err_skipped)
             w(f"       Skipped (high error rate): {skipped_str}")
@@ -2231,7 +2425,7 @@ def generate_report(
         tier_mark = "★" if t.tier == "good+" else "·" if t.tier == "acceptable" else " "
         err_pct = t.error_rate * 100
         think_mark = "T" if t.is_think_only else "S" if t.is_synth_fail else " "
-        api_mark = "A" if t.is_api_blocked and t.score < 15 else " "
+        api_mark = "E" if t.is_env_invalidated else ("A" if t.is_api_blocked and t.score < 15 else " ")
         w(f"  {t.task_id:>12d} {t.score:6.1f} {tier_mark:>1s}{t.tier:>4s} {t.problem_type:>14s} "
           f"{_trunc(t.destination, 8):>8s} {t.unique_tools:4d} {t.total_calls:5d} {err_pct:4.0f}% "
           f"{t.user_len:8d} {hc:>4s} {think_mark}{api_mark}")
@@ -2514,10 +2708,14 @@ async def async_main():
     revision = miner_info.get("model_revision", "?")[:12]
     sl_size = miner_info.get("sampling_list_size", 0)
     matched = miner_info.get("matched", len(raw_trajectories))
-    match_pct = matched / max(sl_size, 1) * 100
     print(f"  Hotkey: {hotkey}...  Revision: {revision}...", file=sys.stderr)
-    print(f"  Sampling list: {sl_size} task_ids, {matched} matched ({match_pct:.1f}%)",
-          file=sys.stderr)
+    if matched > sl_size and sl_size > 0:
+        # --all mode: total tasks exceeds sampling list
+        print(f"  Total tasks: {matched} (sampling list: {sl_size})", file=sys.stderr)
+    else:
+        match_pct = matched / max(sl_size, 1) * 100
+        print(f"  Sampling list: {sl_size} task_ids, {matched} matched ({match_pct:.1f}%)",
+              file=sys.stderr)
 
     if recent:
         sorted_trajs = sorted(raw_trajectories,
